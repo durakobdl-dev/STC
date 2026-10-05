@@ -5,7 +5,7 @@ import random
 from datetime import timedelta
 
 from aiohttp import web
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
@@ -15,7 +15,7 @@ from aiogram.types import (CallbackQuery, FSInputFile, InlineKeyboardButton, Inl
 
 import db
 import game
-from config import ADMIN_IDS, BOT_TOKEN, DATABASE_URL, LICENSE_DAYS, PORT, START_MONEY
+from config import BOT_TOKEN, DATABASE_URL, LICENSE_DAYS, PORT, START_MONEY, is_admin
 from data import BRANDS, CITIES, LICENSE_PRICE, START_TRUCKS, TO_INTERVAL, TRUCK_PHOTOS, dist
 import admin
 import dealer
@@ -134,8 +134,8 @@ async def confirm_brand(call: CallbackQuery):
     uid = call.from_user.id
     name = call.from_user.first_name or "Компания"
     await db.pool.execute(
-        "INSERT INTO players (id, name, home_city, money) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING",
-        uid, name, city, START_MONEY)
+        "INSERT INTO players (id, name, home_city, money, username) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING",
+        uid, name, city, START_MONEY, call.from_user.username)
     await db.pool.execute(
         """INSERT INTO trucks (owner, brand, model, year, mileage, capacity, consumption, speed, city, km_since_to)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)""",
@@ -211,7 +211,7 @@ async def menu_view(uid):
                  [("🏪 Автосалон", "dealer"), ("🏦 Банк", "bank")],
                  [("🏆 Рейтинг", "top:money"), ("❓ Помощь", "help")],
                  [("🔄 Обновить", "menu")]]
-                + ([[("🛠 Админ", "adm")]] if uid in ADMIN_IDS else []))
+                + ([[("🛠 Админ", "adm")]] if is_admin(uid, p["username"]) else []))
     return "\n".join(lines), markup
 
 
@@ -884,6 +884,23 @@ async def top(call: CallbackQuery):
     await show(call, "\n".join(lines), kb(btns))
 
 
+# ---------- запоминаем @юзернеймы игроков (нужны админке) ----------
+class RememberUsername(BaseMiddleware):
+    seen = {}
+
+    async def __call__(self, handler, event, data):
+        u = data.get("event_from_user")
+        if u and self.seen.get(u.id) != u.username:
+            try:
+                done = await db.pool.fetchval(
+                    "UPDATE players SET username=$2 WHERE id=$1 RETURNING id", u.id, u.username)
+                if done:            # игрока ещё нет в базе: попробуем при следующем действии
+                    self.seen[u.id] = u.username
+            except Exception:
+                logging.exception("username update failed")
+        return await handler(event, data)
+
+
 # ---------- запуск ----------
 async def health_server():
     app = web.Application()
@@ -899,6 +916,7 @@ async def main():
     await health_server()
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
+    dp.update.outer_middleware(RememberUsername())
     dp.include_router(admin.router)
     dp.include_router(router)
     asyncio.create_task(game.watcher(bot))

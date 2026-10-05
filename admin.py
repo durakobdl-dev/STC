@@ -1,4 +1,4 @@
-"""Админ-меню. Доступ только у Telegram ID из переменной окружения ADMIN_IDS (через запятую)."""
+"""Админ-меню. Доступ у юзернеймов из переменной окружения ADMIN_USERNAMES (через запятую)."""
 import logging
 from datetime import timedelta
 
@@ -8,7 +8,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 import db
 import dealer
-from config import ADMIN_IDS, LICENSE_DAYS
+from config import LICENSE_DAYS, is_admin as _is_admin
 from data import BRANDS, CITIES
 from util import esc, money, now
 
@@ -16,8 +16,13 @@ router = Router()
 STATE = {}   # id админа -> {"act": ..., "target": ...}: ждём от него следующее сообщение
 
 
-def is_admin(uid):
-    return uid in ADMIN_IDS
+def is_admin(user):
+    return _is_admin(user.id, user.username)
+
+
+def tag(p):
+    """Как показывать игрока: @username, а если его нет, то ID."""
+    return f"@{esc(p['username'])}" if p["username"] else f"ID <code>{p['id']}</code>"
 
 
 def kb(rows):
@@ -58,9 +63,13 @@ def parse_amount(s):
 
 
 async def find_player(token, me):
-    token = token.lower()
-    uid = me if token in ("me", "я") else int(token)
-    return await db.pool.fetchrow("SELECT * FROM players WHERE id=$1", uid)
+    """Игрок по @юзернейму; «me»/«я» — сам админ; чистое число тоже сработает как Telegram ID."""
+    token = token.strip().lstrip("@").lower()
+    if token in ("me", "я"):
+        return await db.pool.fetchrow("SELECT * FROM players WHERE id=$1", me)
+    if token.isdigit():
+        return await db.pool.fetchrow("SELECT * FROM players WHERE id=$1", int(token))
+    return await db.pool.fetchrow("SELECT * FROM players WHERE lower(username)=$1", token)
 
 
 async def notify(bot, uid, text):
@@ -87,7 +96,7 @@ async def admin_page():
 
 @router.message(Command("admin"))
 async def cmd_admin(m: Message):
-    if not is_admin(m.from_user.id):
+    if not is_admin(m.from_user):
         return
     STATE.pop(m.from_user.id, None)
     text, markup = await admin_page()
@@ -96,7 +105,7 @@ async def cmd_admin(m: Message):
 
 @router.callback_query(F.data == "adm")
 async def adm_home(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
+    if not is_admin(call.from_user):
         return await deny(call)
     STATE.pop(call.from_user.id, None)
     text, markup = await admin_page()
@@ -106,29 +115,29 @@ async def adm_home(call: CallbackQuery):
 # ---------- деньги ----------
 @router.callback_query(F.data == "adm:money")
 async def adm_money(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
+    if not is_admin(call.from_user):
         return await deny(call)
     STATE[call.from_user.id] = {"act": "money"}
-    await ashow(call, "💰 <b>Деньги игроку</b>\n\nОтправьте сообщением: <code>ID сумма</code>\n"
-                      "Примеры:\n<code>123456789 500000</code>\n<code>123456789 2м</code> (2 млн)\n"
-                      "<code>123456789 -50к</code> (списать 50 тыс.)\n<code>me 1м</code> (себе)\n\n"
-                      "ID игроков смотрите в «👥 Список игроков».",
+    await ashow(call, "💰 <b>Деньги игроку</b>\n\nОтправьте сообщением: <code>@юзернейм сумма</code>\n"
+                      "Примеры:\n<code>@ivan 500000</code>\n<code>@ivan 2м</code> (2 млн)\n"
+                      "<code>@ivan -50к</code> (списать 50 тыс.)\n<code>me 1м</code> (себе)\n\n"
+                      "Игрок должен был хотя бы раз открыть бота после обновления. Список: «👥 Список игроков».",
                 kb([[("⬅️ Админ-меню", "adm")]]))
 
 
 # ---------- фуры ----------
 @router.callback_query(F.data == "adm:truck")
 async def adm_truck(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
+    if not is_admin(call.from_user):
         return await deny(call)
     STATE[call.from_user.id] = {"act": "truck"}
-    await ashow(call, "🚚 <b>Выдать фуру</b>\n\nОтправьте сообщением ID игрока (или <code>me</code> для себя). "
+    await ashow(call, "🚚 <b>Выдать фуру</b>\n\nОтправьте сообщением @юзернейм игрока (или <code>me</code> для себя). "
                       "Фура будет новая, в его домашнем городе.", kb([[("⬅️ Админ-меню", "adm")]]))
 
 
 @router.callback_query(F.data.startswith("adm:t:"))
 async def adm_truck_give(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
+    if not is_admin(call.from_user):
         return await deny(call)
     _, _, target, j = call.data.split(":")
     target, b = int(target), BRANDS[int(j)]
@@ -143,40 +152,40 @@ async def adm_truck_give(call: CallbackQuery):
         target, b[0], b[1], dealer.NOW_YEAR, b[3], b[4], b[5], p["home_city"])
     await notify(call.bot, target, f"🎁 Администрация выдала вам фуру: {b[0]} {b[1]} (новая) в городе {p['home_city']}.")
     STATE.pop(call.from_user.id, None)
-    await ashow(call, f"✅ Выдана {b[0]} {b[1]} игроку {esc(p['name'])} (<code>{target}</code>), город {esc(p['home_city'])}.",
+    await ashow(call, f"✅ Выдана {b[0]} {b[1]} игроку {esc(p['name'])} ({tag(p)}), город {esc(p['home_city'])}.",
                 kb([[("🚚 Ещё фуру", "adm:truck")], [("⬅️ Админ-меню", "adm")]]))
 
 
 # ---------- лицензии ----------
 @router.callback_query(F.data == "adm:lic")
 async def adm_lic(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
+    if not is_admin(call.from_user):
         return await deny(call)
     STATE[call.from_user.id] = {"act": "lic"}
-    await ashow(call, f"🪪 <b>Лицензии</b>\n\nОтправьте ID игрока (или <code>me</code>): "
+    await ashow(call, f"🪪 <b>Лицензии</b>\n\nОтправьте @юзернейм игрока (или <code>me</code>): "
                       f"получит лицензии на все города на {LICENSE_DAYS} дней.", kb([[("⬅️ Админ-меню", "adm")]]))
 
 
 # ---------- игроки ----------
 @router.callback_query(F.data == "adm:players")
 async def adm_players(call: CallbackQuery):
-    if not is_admin(call.from_user.id):
+    if not is_admin(call.from_user):
         return await deny(call)
     rows = await db.pool.fetch(
-        """SELECT p.id, p.name, p.money, p.home_city, (SELECT count(*) FROM trucks t WHERE t.owner=p.id) AS n
+        """SELECT p.id, p.username, p.name, p.money, p.home_city, (SELECT count(*) FROM trucks t WHERE t.owner=p.id) AS n
            FROM players p ORDER BY p.money DESC LIMIT 25""")
     lines = ["👥 <b>Игроки</b> (по деньгам, до 25)\n"]
     for r in rows:
-        lines.append(f"<code>{r['id']}</code> · {esc(r['name'])} · {money(r['money'])} · 🚚 {r['n']} · {esc(r['home_city'])}")
+        lines.append(f"{tag(r)} · {esc(r['name'])} · {money(r['money'])} · 🚚 {r['n']} · {esc(r['home_city'])}")
     if not rows:
         lines.append("Пока никого.")
-    lines.append("\nНажмите на ID, чтобы скопировать.")
+    lines.append("\nУ кого вместо @юзернейма показан ID: игрок не заходил в бота после обновления или у него нет юзернейма в Telegram. ID тоже работает.")
     await ashow(call, "\n".join(lines), kb([[("⬅️ Админ-меню", "adm")]]))
 
 
 # ---------- ввод текста админом ----------
 def waiting(m: Message):
-    return bool(m.text) and is_admin(m.from_user.id) and m.from_user.id in STATE
+    return bool(m.text) and is_admin(m.from_user) and m.from_user.id in STATE
 
 
 @router.message(waiting)
@@ -188,23 +197,23 @@ async def admin_input(m: Message):
     try:
         if st["act"] == "money":
             if len(parts) != 2:
-                raise ValueError("нужно два значения: ID и сумма")
+                raise ValueError("нужно два значения: @юзернейм и сумма")
             p = await find_player(parts[0], uid)
             if not p:
-                return await m.answer("Игрок с таким ID не найден. Проверьте ID и отправьте ещё раз.", reply_markup=back)
+                return await m.answer("Игрок не найден. Проверьте @юзернейм (он должен был открыть бота после обновления) и отправьте ещё раз.", reply_markup=back)
             amount = parse_amount(parts[1])
             new = await db.pool.fetchval(
                 "UPDATE players SET money = money + $2 WHERE id=$1 RETURNING money", p["id"], amount)
             word = "начислила" if amount >= 0 else "списала"
             await notify(m.bot, p["id"], f"🏛 Администрация {word} {money(abs(amount))}. Баланс: {money(new)}")
             STATE.pop(uid, None)
-            await m.answer(f"✅ {esc(p['name'])} (<code>{p['id']}</code>): {'+' if amount >= 0 else '−'}{money(abs(amount))}\n"
+            await m.answer(f"✅ {esc(p['name'])} ({tag(p)}): {'+' if amount >= 0 else '−'}{money(abs(amount))}\n"
                            f"Баланс теперь: <b>{money(new)}</b>",
                            reply_markup=kb([[("💰 Ещё", "adm:money")], [("⬅️ Админ-меню", "adm")]]))
         elif st["act"] == "truck":
             p = await find_player(parts[0], uid)
             if not p:
-                return await m.answer("Игрок с таким ID не найден. Проверьте ID и отправьте ещё раз.", reply_markup=back)
+                return await m.answer("Игрок не найден. Проверьте @юзернейм (он должен был открыть бота после обновления) и отправьте ещё раз.", reply_markup=back)
             rows = [[(f"{b[0]} {b[1]} · {b[3]} т · {b[5]} км/ч", f"adm:t:{p['id']}:{j}")] for j, b in enumerate(BRANDS)]
             rows.append([("⬅️ Админ-меню", "adm")])
             STATE.pop(uid, None)
@@ -213,7 +222,7 @@ async def admin_input(m: Message):
         elif st["act"] == "lic":
             p = await find_player(parts[0], uid)
             if not p:
-                return await m.answer("Игрок с таким ID не найден. Проверьте ID и отправьте ещё раз.", reply_markup=back)
+                return await m.answer("Игрок не найден. Проверьте @юзернейм (он должен был открыть бота после обновления) и отправьте ещё раз.", reply_markup=back)
             async with db.pool.acquire() as c:
                 async with c.transaction():
                     for city in CITIES:
@@ -226,10 +235,10 @@ async def admin_input(m: Message):
                     await c.execute("DELETE FROM orders WHERE owner=$1", p["id"])
             await notify(m.bot, p["id"], f"🎁 Администрация выдала вам лицензии на все города на {LICENSE_DAYS} дней.")
             STATE.pop(uid, None)
-            await m.answer(f"✅ {esc(p['name'])} (<code>{p['id']}</code>) получил лицензии на все города.",
+            await m.answer(f"✅ {esc(p['name'])} ({tag(p)}) получил лицензии на все города.",
                            reply_markup=kb([[("🪪 Ещё", "adm:lic")], [("⬅️ Админ-меню", "adm")]]))
     except ValueError as e:
-        await m.answer("⚠️ Не понял формат. Нужно: ID и сумма, например <code>123456789 500000</code> "
+        await m.answer("⚠️ Не понял формат. Нужно: @юзернейм и сумма, например <code>@ivan 500000</code> "
                        "(или <code>me 1м</code>). Попробуйте ещё раз или вернитесь в меню.", reply_markup=back)
     except Exception:
         logging.exception("admin input failed")
