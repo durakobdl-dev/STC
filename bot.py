@@ -15,8 +15,9 @@ from aiogram.types import (CallbackQuery, FSInputFile, InlineKeyboardButton, Inl
 
 import db
 import game
-from config import BOT_TOKEN, DATABASE_URL, LICENSE_DAYS, PORT, START_MONEY
+from config import ADMIN_IDS, BOT_TOKEN, DATABASE_URL, LICENSE_DAYS, PORT, START_MONEY
 from data import BRANDS, CITIES, LICENSE_PRICE, START_TRUCKS, TO_INTERVAL, TRUCK_PHOTOS, dist
+import admin
 import dealer
 import drivers
 import finance
@@ -75,7 +76,7 @@ TUTORIAL = [
     "📦 <b>Заказы</b>\n\nНажмите «Взять заказ» в главном меню. Заказы берутся только из города, где сейчас стоит фура. Для рейсов между городами нужна "
     "лицензия на город назначения (действует 14 дней). Пригородные рейсы на 2–4 часа лицензии не требуют: с них удобно начинать.",
     "⛽ <b>Деньги и сроки</b>\n\nПеред рейсом вы получаете аванс 30%, из него и ваших денег оплачивается топливо. "
-    "У каждого заказа есть срок: за опоздание оплата уменьшается. Водитель отдыхает до 5 часов после каждых 9 часов в пути.",
+    "У каждого заказа есть срок: за опоздание оплата уменьшается. Время в пути близко к реальному на коротких рейсах и сокращено на дальних.",
     "🏙 <b>Выберите стартовый город</b>\n\nОттуда начнётся ваша компания.",
 ]
 
@@ -209,7 +210,8 @@ async def menu_view(uid):
                  [("👥 Водители", "drivers"), ("🪪 Лицензии", "lic")],
                  [("🏪 Автосалон", "dealer"), ("🏦 Банк", "bank")],
                  [("🏆 Рейтинг", "top:money"), ("❓ Помощь", "help")],
-                 [("🔄 Обновить", "menu")]])
+                 [("🔄 Обновить", "menu")]]
+                + ([[("🛠 Админ", "adm")]] if uid in ADMIN_IDS else []))
     return "\n".join(lines), markup
 
 
@@ -897,6 +899,7 @@ async def main():
     await health_server()
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
+    dp.include_router(admin.router)
     dp.include_router(router)
     asyncio.create_task(game.watcher(bot))
     await bot.delete_webhook(drop_pending_updates=True)

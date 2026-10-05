@@ -10,7 +10,7 @@ import drivers
 import finance
 import maintenance
 from util import bar, dur, esc, money, now
-from config import (ADVANCE_PCT, DEFAULT_DRIVER_RATING, DRIVE_HOURS_PER_DAY, REST_HOURS_PER_DAY)
+from config import ADVANCE_PCT, DEFAULT_DRIVER_RATING, FAR_SPEED, REAL_KM, REST_PCT
 from data import (CARGO, CLIENTS, FUEL, SUBURBAN, URGENT_CLIENTS, dist, waypoints)
 
 
@@ -20,13 +20,17 @@ def level(xp):
 
 # ---------- расчёты ----------
 def travel_seconds(km, speed):
-    drive_h = km / speed
-    rest_h = int(drive_h // DRIVE_HOURS_PER_DAY) * REST_HOURS_PER_DAY
+    """Время в пути. Близко как в жизни, дальше сжато (см. config.py)."""
+    k = speed / 82                       # быстрая фура быстрее эталонной
+    near = min(km, REAL_KM) / speed
+    far = max(0, km - REAL_KM) / (FAR_SPEED * k)
+    drive_h = near + far
+    rest_h = max(0.0, drive_h - 3) * REST_PCT / 100
     return int((drive_h + rest_h) * 3600)
 
 
 def load_seconds(tons):
-    return (10 + tons) * 60   # 4 т = 14 мин, 24 т = 34 мин
+    return int((6 + tons * 0.5) * 60)    # 4 т = 8 мин, 24 т = 18 мин
 
 
 def fuel_cost(km, cons, a, b):
