@@ -21,7 +21,7 @@ import dealer
 import drivers
 import finance
 import maintenance
-from game import dur, esc, money
+from game import bar, dur, esc, money
 
 router = Router()
 
@@ -72,7 +72,7 @@ async def get_player(uid):
 TUTORIAL = [
     "🚛 <b>Симулятор Транспортной компании</b>\n\nВы строите транспортный бизнес в России: от одной "
     "б/у фуры до собственного автопарка. Всё идёт в реальном времени: фура едет столько, сколько ехала бы в жизни.",
-    "📦 <b>Заказы</b>\n\nЗаказы берутся только из города, где сейчас стоит фура. Для рейсов между городами нужна "
+    "📦 <b>Заказы</b>\n\nНажмите «Взять заказ» в главном меню. Заказы берутся только из города, где сейчас стоит фура. Для рейсов между городами нужна "
     "лицензия на город назначения (действует 14 дней). Пригородные рейсы на 2–4 часа лицензии не требуют: с них удобно начинать.",
     "⛽ <b>Деньги и сроки</b>\n\nПеред рейсом вы получаете аванс 30%, из него и ваших денег оплачивается топливо. "
     "У каждого заказа есть срок: за опоздание оплата уменьшается. Водитель отдыхает до 5 часов после каждых 9 часов в пути.",
@@ -141,21 +141,131 @@ async def confirm_brand(call: CallbackQuery):
         uid, b[0], b[1], b[2], random.randint(700, 1100) * 1000, b[3], b[4], b[5], city,
         random.randint(0, int(TO_INTERVAL.get((b[0], b[1]), 60000) * 0.7)))
     text, markup = await menu_view(uid)
-    await show(call, "✅ Компания создана! Загляните в «Заказы» и отправьте первый рейс.\n\n" + text, markup)
+    await show(call, "✅ Компания создана! Нажмите «📦 Взять заказ» и отправьте первый рейс.\n\n" + text, markup)
 
 
 # ---------- главное меню ----------
 async def menu_view(uid):
     p = await get_player(uid)
-    n = await db.pool.fetchval("SELECT count(*) FROM trucks WHERE owner=$1", uid)
-    busy = await db.pool.fetchval("SELECT count(*) FROM trucks WHERE owner=$1 AND busy", uid)
-    text = (f"🚛 <b>Симулятор Транспортной компании</b>\n\n🏢 {esc(p['name'])}\n"
-            f"⭐ Уровень {game.level(p['xp'])} · опыт {p['xp']}\n💰 {money(p['money'])}\n"
-            f"🚚 Фур: {n} (в рейсе: {busy})")
-    markup = kb([[("🚚 Гараж", "garage"), ("🪪 Лицензии", "lic")],
-                 [("👥 Водители", "drivers"), ("🏦 Банк", "bank")],
-                 [("🏪 Автосалон", "dealer"), ("🏆 Рейтинг", "top:money")]])
-    return text, markup
+    n_now = game.now()
+    trucks = await db.pool.fetch("SELECT * FROM trucks WHERE owner=$1 ORDER BY id", uid)
+    busy = sum(1 for t in trucks if t["busy"])
+    service = sum(1 for t in trucks if not t["busy"] and maintenance.in_service(t))
+    free = len(trucks) - busy - service
+    ds = await db.pool.fetch("SELECT busy FROM drivers WHERE owner=$1", uid)
+    lic = await db.pool.fetch(
+        "SELECT city, expires_at FROM licenses WHERE owner=$1 AND expires_at>now() ORDER BY expires_at", uid)
+    bills = await finance.open_bills(uid)
+    trips = await db.pool.fetch(
+        """SELECT tr.*, t.brand, t.model FROM trips tr JOIN trucks t ON t.id=tr.truck_id
+           WHERE tr.owner=$1 AND tr.settled=FALSE ORDER BY tr.finish_at""", uid)
+
+    lvl = game.level(p["xp"])
+    lo, hi = 60 * (lvl - 1) ** 2, 60 * lvl ** 2
+    lines = [f"🚛 <b>Транспортная компания «{esc(p['name'])}»</b>",
+             f"🏠 Базируется: {esc(p['home_city'])}\n",
+             f"⭐ Уровень {lvl} · {bar((p['xp'] - lo) / max(1, hi - lo))} {p['xp']}/{hi} опыта",
+             f"💰 Баланс: <b>{money(p['money'])}</b>\n",
+             "━━━━━━━━━━━━━━",
+             f"🚚 <b>Автопарк:</b> {len(trucks)} · 🟢 свободно {free} · 🔴 в рейсе {busy} · 🔧 на ТО {service}"]
+    if ds:
+        lines.append(f"👥 <b>Водители:</b> {len(ds)} · свободны {sum(1 for d in ds if not d['busy'])}")
+    else:
+        lines.append("👥 <b>Водители:</b> нет (вы водите сами)")
+    if lic:
+        lines.append(f"🪪 <b>Лицензии:</b> {len(lic)} из {len(CITIES)} · ближайшая ({esc(lic[0]['city'])}) "
+                     f"истекает через {dur((lic[0]['expires_at'] - n_now).total_seconds())}")
+    else:
+        lines.append("🪪 <b>Лицензии:</b> нет (доступны только пригородные рейсы)")
+    lines.append(f"📊 <b>Итого:</b> рейсов {p['trips_done']} · {p['total_km']:,} км · "
+                 f"заработано {money(p['total_earned'])}".replace(",", " "))
+
+    if trips:
+        lines.append("\n━━━━━━━━━━━━━━\n🛣 <b>Сейчас в пути:</b>")
+        for tr in trips[:5]:
+            total = (tr["finish_at"] - tr["started_at"]).total_seconds() or 1
+            pr = (n_now - tr["started_at"]).total_seconds() / total
+            left = (tr["finish_at"] - n_now).total_seconds()
+            lines.append(f"🔴 {tr['brand']} {tr['model']} → {esc(tr['to_label'])}\n"
+                         f"    {bar(pr)} {int(max(0, min(1, pr)) * 100)}% · ещё {dur(left)}")
+        if len(trips) > 5:
+            lines.append(f"…и ещё {len(trips) - 5}")
+
+    alerts = []
+    if p["arrested"]:
+        alerts.append("🔒 счёт арестован за долги по налогам")
+    if bills:
+        alerts.append(f"🧾 налоги к оплате: {money(sum(x['due'] for x in bills))}")
+    overdue = sum(1 for t in trucks if t["km_since_to"] >= maintenance.to_interval(t))
+    if overdue:
+        alerts.append(f"🔧 просрочено ТО: {overdue} фур")
+    if free and not busy:
+        alerts.append("😴 фуры простаивают, самое время взять заказ")
+    if alerts:
+        lines.append("\n⚠️ <b>Обратите внимание:</b>\n" + "\n".join("• " + a for a in alerts))
+
+    markup = kb([[("📦 Взять заказ", "ordhub")],
+                 [("🚚 Гараж", "garage"), ("🛣 Рейсы", "trips")],
+                 [("👥 Водители", "drivers"), ("🪪 Лицензии", "lic")],
+                 [("🏪 Автосалон", "dealer"), ("🏦 Банк", "bank")],
+                 [("🏆 Рейтинг", "top:money"), ("❓ Помощь", "help")],
+                 [("🔄 Обновить", "menu")]])
+    return "\n".join(lines), markup
+
+
+@router.callback_query(F.data == "help")
+async def help_page(call: CallbackQuery):
+    text = "❓ <b>Как играть</b>\n\n" + "\n\n".join(TUTORIAL[:3])
+    text += ("\n\n🧭 <b>Быстрый старт:</b> «📦 Взять заказ» в меню → выберите заказ → "
+             "«Взять заказ». Фура поедет сама, а я напишу, когда она приедет.")
+    await show(call, text, kb([[("⬅️ Меню", "menu")]]))
+
+
+@router.callback_query(F.data == "trips")
+async def active_trips(call: CallbackQuery):
+    uid = call.from_user.id
+    trips = await db.pool.fetch(
+        """SELECT tr.*, t.brand, t.model FROM trips tr JOIN trucks t ON t.id=tr.truck_id
+           WHERE tr.owner=$1 AND tr.settled=FALSE ORDER BY tr.finish_at""", uid)
+    if not trips:
+        await show(call, "🛣 <b>Активные рейсы</b>\n\nСейчас ни одна фура не в пути.",
+                   kb([[("📦 Взять заказ", "ordhub")], [("⬅️ Меню", "menu")]]))
+        return
+    lines = ["🛣 <b>Активные рейсы</b>\n"]
+    rows = []
+    n_now = game.now()
+    for tr in trips:
+        total = (tr["finish_at"] - tr["started_at"]).total_seconds() or 1
+        pr = (n_now - tr["started_at"]).total_seconds() / total
+        left = (tr["finish_at"] - n_now).total_seconds()
+        kind = "порожний перегон" if tr["empty"] else f"{tr['cargo']}, {tr['tons']} т · {money(tr['price'])}"
+        lines.append(f"🔴 <b>{tr['brand']} {tr['model']}</b>\n{tr['from_city']} → {esc(tr['to_label'])} · {kind}\n"
+                     f"{bar(pr)} {int(max(0, min(1, pr)) * 100)}% · ещё {dur(left)}\n")
+        rows.append([(f"🔍 {tr['brand']} {tr['model']} → {tr['to_label']}", f"truck:{tr['truck_id']}")])
+    rows.append([("🔄 Обновить", "trips")])
+    rows.append([("⬅️ Меню", "menu")])
+    await show(call, "\n".join(lines), kb(rows))
+
+
+@router.callback_query(F.data == "ordhub")
+async def orders_hub(call: CallbackQuery):
+    """Кнопка «Взять заказ» из меню: выбор свободной фуры (или сразу заказы, если она одна)."""
+    uid = call.from_user.id
+    trucks = await db.pool.fetch("SELECT * FROM trucks WHERE owner=$1 ORDER BY id", uid)
+    free = [t for t in trucks if not t["busy"] and not maintenance.in_service(t)]
+    if not free:
+        await show(call, "📦 <b>Взять заказ</b>\n\nСвободных фур нет: все в рейсе или на ТО. "
+                         "Следить за ними можно в «🛣 Рейсы».",
+                   kb([[("🛣 Рейсы", "trips"), ("🚚 Гараж", "garage")], [("⬅️ Меню", "menu")]]))
+        return
+    if len(free) == 1:
+        await render_orders(call, free[0]["id"])
+        return
+    rows = [[(f"🟢 {t['brand']} {t['model']} · {t['city']} · до {t['capacity']} т", f"orders:{t['id']}")]
+            for t in free]
+    rows.append([("⬅️ Меню", "menu")])
+    await show(call, "📦 <b>Взять заказ</b>\n\nВыберите фуру, для которой ищем заказ. "
+                     "Заказы показываются из города, где она стоит.", kb(rows))
 
 
 @router.callback_query(F.data == "menu")
@@ -401,8 +511,16 @@ async def ins_go(call: CallbackQuery):
 # ---------- заказы ----------
 @router.callback_query(F.data.startswith("orders:"))
 async def orders_list(call: CallbackQuery):
+    await render_orders(call, int(call.data.split(":")[1]))
+
+
+def order_total_s(o, t):
+    """Полное время рейса: погрузка + дорога + разгрузка."""
+    return 2 * game.load_seconds(o["tons"]) + game.travel_seconds(o["km"], t["speed"])
+
+
+async def render_orders(call: CallbackQuery, tid: int):
     uid = call.from_user.id
-    tid = int(call.data.split(":")[1])
     t = await db.pool.fetchrow("SELECT * FROM trucks WHERE id=$1 AND owner=$2", tid, uid)
     if not t or t["busy"]:
         await call.answer("Фура недоступна")
@@ -410,20 +528,42 @@ async def orders_list(call: CallbackQuery):
     lic = await game.licensed_cities(uid)
     await game.ensure_orders(uid, t["city"], lic)
     rows = await db.pool.fetch(
-        "SELECT * FROM orders WHERE owner=$1 AND from_city=$2 AND expires_at>now() ORDER BY km", uid, t["city"])
-    lines = [f"📦 <b>Заказы из города {t['city']}</b>\nГрузоподъёмность: {t['capacity']} т\n"]
+        "SELECT * FROM orders WHERE owner=$1 AND from_city=$2 AND expires_at>now() ORDER BY km, id",
+        uid, t["city"])
+    groups = [
+        ("🔥 <b>Срочные</b> · оплата выше, срок жёстче", [o for o in rows if o["urgent"]]),
+        ("🏘 <b>Пригород</b> · лицензия не нужна, рейсы на пару часов",
+         [o for o in rows if not o["urgent"] and o["to_city"] == o["from_city"]]),
+        ("🛣 <b>Между городами</b> · дальше, но и платят больше",
+         [o for o in rows if not o["urgent"] and o["to_city"] != o["from_city"]]),
+    ]
+    lines = [f"📦 <b>Заказы · {esc(t['city'])}</b>",
+             f"🚚 {t['brand']} {t['model']} · берёт до {t['capacity']} т · ~{t['speed']} км/ч\n"]
     btns = []
-    for i, o in enumerate(rows, 1):
-        flag = "🔥" if o["urgent"] else ("🏘" if o["to_city"] == o["from_city"] else "🛣")
-        big = " ❌" if o["tons"] > t["capacity"] else ""
-        lines.append(f"{i}. {flag} {esc(o['to_label'])} · {o['cargo']} {o['tons']} т · {o['km']} км · "
-                     f"<b>{money(o['price'])}</b>{big}")
-        btns.append((str(i), f"order:{tid}:{o['id']}"))
-    lines.append("\n🔥 срочный · 🏘 пригород · 🛣 между городами · ❌ слишком тяжёлый")
-    if len([c for c in lic if c != t["city"]]) == 0:
-        lines.append("💡 Купите лицензию на город, чтобы появились межгородские заказы.")
-    markup = [btns[i:i + 4] for i in range(0, len(btns), 4)]
-    markup.append([("⬅️ К фуре", f"truck:{tid}")])
+    i = 0
+    for title, items in groups:
+        if not items:
+            continue
+        lines.append(title)
+        for o in items:
+            i += 1
+            fuel = game.fuel_cost(o["km"], t["consumption"], o["from_city"], o["to_city"])
+            heavy = o["tons"] > t["capacity"]
+            lines.append(f"<b>{i}. {esc(o['to_label'])}</b> · {o['cargo']} {o['tons']} т"
+                         + (" ❌ тяжелее, чем берёт фура" if heavy else "") + "\n"
+                         f"    📏 {o['km']} км · ⏱ {dur(order_total_s(o, t))} всего\n"
+                         f"    💰 {money(o['price'])} · 📈 прибыль ~{money(o['price'] - fuel)}")
+            btns.append((str(i), f"order:{tid}:{o['id']}"))
+        lines.append("")
+    if not rows:
+        lines.append("Заказов пока нет, загляните через минуту.")
+    others = [c for c in lic if c != t["city"]]
+    if not others:
+        lines.append("💡 Купите лицензию на город (меню → «🪪 Лицензии»), чтобы появились межгородские заказы.")
+    lines.append("⏱ время считается с погрузкой и разгрузкой · ❌ такой груз не поместится")
+    markup = [btns[k:k + 5] for k in range(0, len(btns), 5)]
+    markup.append([("🔄 Обновить", f"orders:{tid}"), ("🚚 К фуре", f"truck:{tid}")])
+    markup.append([("🏠 Меню", "menu")])
     await show(call, "\n".join(lines), kb(markup))
 
 
@@ -444,6 +584,7 @@ async def order_view(call: CallbackQuery):
             f"💰 Оплата: <b>{money(o['price'])}</b>\n💵 Аванс {game.ADVANCE_PCT}%: {money(o['price'] * game.ADVANCE_PCT // 100)}\n"
             f"⛽ Топливо ~{money(fuel)}\n📈 Прибыль ~{money(o['price'] - fuel)}\n\n"
             f"📦 Погрузка и разгрузка: {dur(ld)} + {dur(ld)}\n🛣 В пути: {dur(trav)}\n"
+            f"⏱ Всего рейс займёт: <b>{dur(ld * 2 + trav)}</b>\n"
             f"⏳ Срок доставки: {dur(o['limit_s'])}")
     await show(call, text, kb([[("✅ Взять заказ", f"take:{tid}:{oid}")], [("⬅️ К заказам", f"orders:{tid}")]]))
 

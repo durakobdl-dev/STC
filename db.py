@@ -1,5 +1,7 @@
 import asyncpg
 
+from data import BRANDS
+
 pool = None
 
 SCHEMA = """
@@ -72,3 +74,7 @@ async def init(url):
     pool = await asyncpg.create_pool(url, min_size=1, max_size=5, statement_cache_size=0)
     async with pool.acquire() as c:
         await c.execute(SCHEMA)
+        # скорости фур обновились: подтягиваем уже купленные фуры до новых значений
+        for b in BRANDS:
+            await c.execute("UPDATE trucks SET speed=$3 WHERE brand=$1 AND model=$2 AND speed<$3",
+                            b[0], b[1], b[5])

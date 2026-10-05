@@ -26,7 +26,7 @@ def travel_seconds(km, speed):
 
 
 def load_seconds(tons):
-    return (20 + 2 * tons) * 60
+    return (10 + tons) * 60   # 4 т = 14 мин, 24 т = 34 мин
 
 
 def fuel_cost(km, cons, a, b):
@@ -51,21 +51,28 @@ def make_order(owner, city, licensed):
     price = max(3000, int(tons * km * CARGO[cargo] * random.uniform(0.9, 1.1) / 100) * 100)
     if urgent:
         price = int(price * 1.5 / 100) * 100
-    base = load_seconds(tons) + travel_seconds(km, 66)
+    base = load_seconds(tons) + travel_seconds(km, 82)
     limit = int(base * (1.08 if urgent else 1.25)) + 3600
     client = random.choice(URGENT_CLIENTS if urgent else CLIENTS)
     expires = now() + timedelta(minutes=random.randint(60, 240))
     return (owner, city, to, label, cargo, tons, km, price, client, urgent, limit, expires)
 
 
-async def ensure_orders(owner, city, licensed, target=7):
+async def ensure_orders(owner, city, licensed, target=8):
     await db.pool.execute("DELETE FROM orders WHERE owner=$1 AND expires_at<=now()", owner)
-    have = await db.pool.fetchval("SELECT count(*) FROM orders WHERE owner=$1 AND from_city=$2", owner, city)
-    for _ in range(max(0, target - have)):
+    rows = await db.pool.fetch("SELECT to_label, cargo FROM orders WHERE owner=$1 AND from_city=$2", owner, city)
+    seen = {(r["to_label"], r["cargo"]) for r in rows}
+    for _ in range(max(0, target - len(rows))):
+        order = None
+        for _try in range(8):          # стараемся не повторять «пункт + груз», чтобы список был разнообразным
+            order = make_order(owner, city, licensed)
+            if (order[3], order[4]) not in seen:
+                break
+        seen.add((order[3], order[4]))
         await db.pool.execute(
             """INSERT INTO orders (owner, from_city, to_city, to_label, cargo, tons, km, price,
                client, urgent, limit_s, expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)""",
-            *make_order(owner, city, licensed))
+            *order)
 
 
 async def licensed_cities(owner):
