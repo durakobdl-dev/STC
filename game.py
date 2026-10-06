@@ -52,7 +52,7 @@ def make_order(owner, city, licensed):
     tons = random.randint(4, 24)
     cargo = random.choice(list(CARGO))
     urgent = random.random() < 0.12
-    price = max(3000, int(tons * km * CARGO[cargo] * random.uniform(0.9, 1.1) / 100) * 100)
+    price = max(15000, int(tons * km * CARGO[cargo] * random.uniform(0.9, 1.1) / 100) * 100)
     if urgent:
         price = int(price * 1.5 / 100) * 100
     base = load_seconds(tons) + travel_seconds(km, 82)
