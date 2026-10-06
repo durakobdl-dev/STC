@@ -1,7 +1,5 @@
 import asyncpg
 
-from data import BRANDS
-
 pool = None
 
 SCHEMA = """
@@ -58,7 +56,6 @@ CREATE TABLE IF NOT EXISTS tax_bills (
   vat BIGINT NOT NULL DEFAULT 0, profit BIGINT NOT NULL DEFAULT 0, payroll BIGINT NOT NULL DEFAULT 0,
   total BIGINT NOT NULL, due BIGINT NOT NULL, deadline TIMESTAMPTZ NOT NULL,
   penalized BOOLEAN NOT NULL DEFAULT FALSE, paid_at TIMESTAMPTZ);
-ALTER TABLE players ADD COLUMN IF NOT EXISTS username TEXT;
 CREATE TABLE IF NOT EXISTS dealer_stock (
   id SERIAL PRIMARY KEY, city TEXT, day DATE, brand TEXT, model TEXT, year INT, mileage INT,
   price BIGINT, is_new BOOLEAN);
@@ -75,7 +72,3 @@ async def init(url):
     pool = await asyncpg.create_pool(url, min_size=1, max_size=5, statement_cache_size=0)
     async with pool.acquire() as c:
         await c.execute(SCHEMA)
-        # скорости фур обновились: подтягиваем уже купленные фуры до новых значений
-        for b in BRANDS:
-            await c.execute("UPDATE trucks SET speed=$3 WHERE brand=$1 AND model=$2 AND speed<$3",
-                            b[0], b[1], b[5])
