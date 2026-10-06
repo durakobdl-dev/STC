@@ -45,12 +45,23 @@ def make_order(owner, city, licensed):
     else:
         to = random.choice(inter)
         km, label = dist(city, to), to
-    tons = random.randint(4, 24)
+    tons = random.randint(10, 24) if km < 300 else random.randint(4, 24)
     cargo = random.choice(list(CARGO))
     urgent = random.random() < 0.12
-    # Короткие маршруты (<200 км) платят больше за км — погрузка/разгрузка съедает время
-    short_bonus = max(1.0, 3.0 - km / 200) if km < 400 else 1.0
-    price = max(20_000, int(tons * km * CARGO[cargo] * short_bonus * random.uniform(0.9, 1.1) / 100) * 100)
+    # Короткие маршруты платят больше за км — погрузка/разгрузка съедает время
+    if km < 150:
+        short_bonus = 3.5
+    elif km < 300:
+        short_bonus = max(1.5, 3.0 - km / 200)
+    elif km < 400:
+        short_bonus = 1.2
+    else:
+        short_bonus = 1.0
+    min_price = 30_000 if km < 150 else (25_000 if km < 300 else 20_000)
+    max_price = 70_000 if km < 150 else (90_000 if km < 300 else None)
+    price = max(min_price, int(tons * km * CARGO[cargo] * short_bonus * random.uniform(0.9, 1.1) / 100) * 100)
+    if max_price:
+        price = min(price, max_price)
     if urgent:
         price = int(price * 1.5 / 100) * 100
     base = load_seconds(tons) + travel_seconds(km, 88)
