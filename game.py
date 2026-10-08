@@ -43,7 +43,9 @@ def travel_seconds(km, speed):
     if km <= REAL_KM:
         drive_h = km / eff_speed
     else:
-        drive_h = REAL_KM / eff_speed + (km - REAL_KM) / (FAR_SPEED * eff_speed / 0.95)
+        # Первые REAL_KM с реальной скоростью, остаток со сжатой скоростью FAR_SPEED
+        drive_h = REAL_KM / eff_speed + (km - REAL_KM) / FAR_SPEED
+        # Отдых водителя в дальних рейсах (после 3 часов в пути)
         extra_h = max(0, drive_h - 3)
         drive_h += extra_h * REST_PCT / 100
     return int(drive_h * 3600)
@@ -82,7 +84,7 @@ def make_order(owner, city, licensed):
     else:
         short_bonus = 1.0
     min_price = 30_000 if km < 150 else (25_000 if km < 300 else 20_000)
-    max_price = 70_000 if km < 150 else (90_000 if km < 300 else None)
+    max_price = 70_000 if km < 150 else (90_000 if km < 300 else 350_000)  # макс 350k для дальних
     price = max(min_price, int(tons * km * CARGO[cargo] * short_bonus * random.uniform(0.9, 1.1) / 100) * 100)
     if max_price:
         price = min(price, max_price)
