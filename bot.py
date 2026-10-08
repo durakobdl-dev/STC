@@ -1081,7 +1081,8 @@ async def admin_menu(call: CallbackQuery):
         lines.append("")
 
         rows = [[("📊 Статистика", "admin:stats"), ("📋 Логи", "admin:logs")],
-                [("🚫 Бан/Разбан", "admin:ban"), ("💳 Очистить долг", "admin:debt")],
+                [("👥 Все игроки", "admin:players"), ("💳 Очистить долг", "admin:debt")],
+                [("🚫 Бан/Разбан", "admin:ban"), ("🔄 Вайп", "admin:wipe")],
                 [("💰 Выдать деньги", "admin:give_money"), ("🚚 Выдать фуру", "admin:give_truck")],
                 [("⬅️ Меню", "menu")]]
 
@@ -1242,13 +1243,67 @@ async def admin_give_truck_menu(call: CallbackQuery):
         for i, b in enumerate(BRANDS, 1):
             lines.append(f"{i}. {b[0]} {b[1]}")
         lines.append("")
-        lines.append("Введите ID игрока и номер модели (через пробел):")
-        lines.append("Например: 123456789 1")
+        lines.append("Введите ID или имя игрока и номер модели (через пробел):")
+        lines.append("Например: 123456789 1 или username 1")
 
         rows = [[("⬅️ Меню админа", "admin")]]
         await show(call, "\n".join(lines), kb(rows))
     except Exception as e:
         logging.exception("admin_give_truck_menu error")
+        await call.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
+
+
+@router.callback_query(F.data == "admin:players")
+async def admin_players_list(call: CallbackQuery):
+    """Показать список всех игроков"""
+    try:
+        uid = call.from_user.id
+        from config import is_admin
+        username = call.from_user.username or ""
+        if not is_admin(uid, username):
+            await call.answer("❌ Доступ запрещен", show_alert=True)
+            return
+
+        players = await admin.get_all_players(100)
+
+        lines = ["👥 <b>Все игроки (последние 100)</b>\n"]
+        if players:
+            for p in players:
+                created = p['created_at'].strftime("%Y-%m-%d %H:%M")
+                lines.append(f"• {esc(p['name'])} (ID: {p['id']})")
+                lines.append(f"  Уровень: {game.level(p['xp'])}, Рейсов: {p['trips_done']}, км: {p['total_km']:,}".replace(",", " "))
+                lines.append(f"  Деньги: {money(p['money'])}, Создан: {created}")
+        else:
+            lines.append("Нет игроков")
+
+        rows = [[("⬅️ Меню админа", "admin")]]
+        await show(call, "\n".join(lines), kb(rows))
+    except Exception as e:
+        logging.exception("admin_players_list error")
+        await call.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
+
+
+@router.callback_query(F.data == "admin:wipe")
+async def admin_wipe_confirm(call: CallbackQuery):
+    """Подтверждение вайпа"""
+    try:
+        uid = call.from_user.id
+        from config import is_admin
+        username = call.from_user.username or ""
+        if not is_admin(uid, username):
+            await call.answer("❌ Доступ запрещен", show_alert=True)
+            return
+
+        lines = ["🔄 <b>ПОЛНЫЙ ВАЙ ИГРЫ</b>\n"]
+        lines.append("⚠️ ЭТО УДАЛИТ ВСЕ ДАННЫЕ ИГРЫ")
+        lines.append("")
+        lines.append("Чтобы подтвердить, введите код:")
+        lines.append("<code>WIPE_ALL_CONFIRM</code>")
+
+        rows = [[("⬅️ Меню админа", "admin")]]
+        await show(call, "\n".join(lines), kb(rows))
+    except Exception as e:
+        logging.exception("admin_wipe_confirm error")
         await call.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
 
 
@@ -1266,42 +1321,61 @@ async def admin_message_handler(m: Message):
         if not text:
             return
 
+        # Проверка команды вайпа
+        if text == "WIPE_ALL_CONFIRM":
+            result = await admin.wipe_all(uid, "WIPE_ALL_CONFIRM")
+            await m.answer(result)
+            return
+
         # Обработка команд админа
-        # TODO: Улучшить с помощью FSM состояний
         parts = text.split()
 
         if len(parts) >= 2:
+            # Попытаемся найти игрока по ID или имени
+            player_query = parts[0]
+            player = None
+            player_id = None
+
+            # Сначала пробуем как ID
             try:
-                player_id = int(parts[0])
+                player_id = int(player_query)
+                player = await db.pool.fetchrow("SELECT * FROM players WHERE id=$1", player_id)
+            except ValueError:
+                # Не число, ищем по имени
+                players = await admin.find_player_by_name(player_query)
+                if players:
+                    player = players[0]
+                    player_id = player["id"]
 
-                if len(parts) == 2 and parts[1].isdigit():
-                    # Выдать деньги или фуру
-                    amount = int(parts[1])
-                    if amount > 10_000_000:
-                        await m.answer("❌ Слишком много денег (макс 10M)")
-                        return
+            if not player:
+                await m.answer(f"❌ Игрок не найден: {player_query}")
+                return
 
-                    err = await admin.give_money(uid, player_id, amount)
+            if len(parts) == 2 and parts[1].isdigit():
+                # Выдать деньги
+                amount = int(parts[1])
+                if amount > 10_000_000:
+                    await m.answer("❌ Слишком много денег (макс 10M)")
+                    return
+
+                err = await admin.give_money(uid, player_id, amount)
+                if err:
+                    await m.answer(f"❌ {err}")
+                else:
+                    await m.answer(f"✅ Выдано {money(amount)} игроку {esc(player['name'])} (ID {player_id})")
+
+            elif len(parts) == 3 and parts[1].isdigit():
+                # Выдать фуру
+                truck_idx = int(parts[1]) - 1
+                if 0 <= truck_idx < len(BRANDS):
+                    brand, model = BRANDS[truck_idx][0], BRANDS[truck_idx][1]
+                    err = await admin.give_truck(uid, player_id, brand, model)
                     if err:
                         await m.answer(f"❌ {err}")
                     else:
-                        await m.answer(f"✅ Выдано {money(amount)} игроку ID {player_id}")
-
-                elif len(parts) >= 3:
-                    # Возможно выдача фуры
-                    try:
-                        truck_idx = int(parts[1]) - 1
-                        if 0 <= truck_idx < len(BRANDS):
-                            brand, model = BRANDS[truck_idx][0], BRANDS[truck_idx][1]
-                            err = await admin.give_truck(uid, player_id, brand, model)
-                            if err:
-                                await m.answer(f"❌ {err}")
-                            else:
-                                await m.answer(f"✅ Выдана фура {brand} {model} игроку ID {player_id}")
-                    except:
-                        pass
-            except ValueError:
-                pass
+                        await m.answer(f"✅ Выдана фура {brand} {model} игроку {esc(player['name'])} (ID {player_id})")
+                else:
+                    await m.answer(f"❌ Неверный номер модели (1-{len(BRANDS)})")
     except Exception as e:
         logging.exception("admin_message_handler error")
 

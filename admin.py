@@ -137,9 +137,55 @@ async def clear_loans(admin_id, player_id):
     """Очистить кредиты"""
     result = await db.pool.fetchval(
         "SELECT coalesce(sum(remaining),0) FROM loans WHERE owner=$1", player_id)
-    
+
     if result > 0:
         await db.pool.execute("DELETE FROM loans WHERE owner=$1", player_id)
         await log_action(admin_id, "clear_loans", player_id, f"{money(result)}")
         return f"Кредиты очищены: {money(result)}"
     return "Нет активных кредитов"
+
+
+async def get_all_players(limit=50):
+    """Получить список всех игроков"""
+    return await db.pool.fetch(
+        """SELECT id, name, money, xp, trips_done, total_km, created_at
+           FROM players ORDER BY created_at DESC LIMIT $1""", limit)
+
+
+async def wipe_all(admin_id, confirm_code):
+    """Вайп всей игры (сброс всех данных)"""
+    # Требуется код подтверждения для безопасности
+    if confirm_code != "WIPE_ALL_CONFIRM":
+        return "Неверный код подтверждения"
+
+    async with db.pool.acquire() as c:
+        async with c.transaction():
+            # Удаляем все данные в правильном порядке
+            await c.execute("DELETE FROM admin_logs")
+            await c.execute("DELETE FROM player_bans")
+            await c.execute("DELETE FROM fines")
+            await c.execute("DELETE FROM incidents")
+            await c.execute("DELETE FROM contracts")
+            await c.execute("DELETE FROM fuel_cards")
+            await c.execute("DELETE FROM loans")
+            await c.execute("DELETE FROM tax_bills")
+            await c.execute("DELETE FROM ledger")
+            await c.execute("DELETE FROM candidates")
+            await c.execute("DELETE FROM drivers")
+            await c.execute("DELETE FROM dealer_stock")
+            await c.execute("DELETE FROM fines")
+            await c.execute("DELETE FROM trips")
+            await c.execute("DELETE FROM licenses")
+            await c.execute("DELETE FROM orders")
+            await c.execute("DELETE FROM trucks")
+            await c.execute("DELETE FROM players")
+
+    await log_action(admin_id, "wipe_all", None, "Вайп всей игры")
+    return "✅ ВАЙ ВЫПОЛНЕН - ВСЕ ДАННЫЕ УДАЛЕНЫ"
+
+
+async def find_player_by_name(name: str):
+    """Найти игрока по юзернейму (частичное совпадение)"""
+    return await db.pool.fetch(
+        "SELECT id, name, money, xp, trips_done FROM players WHERE lower(name) LIKE lower($1) LIMIT 10",
+        f"%{name}%")
