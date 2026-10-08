@@ -83,6 +83,13 @@ CREATE TABLE IF NOT EXISTS contracts (
   from_city TEXT, to_city TEXT, km INT, tons INT, price_per_trip BIGINT,
   trips_total INT NOT NULL DEFAULT 7, trips_done INT NOT NULL DEFAULT 0,
   expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS admin_logs (
+  id BIGSERIAL PRIMARY KEY, admin_id BIGINT NOT NULL, action TEXT NOT NULL,
+  target_id BIGINT, details TEXT, ts TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS player_bans (
+  id SERIAL PRIMARY KEY, player_id BIGINT NOT NULL UNIQUE, banned_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  reason TEXT, banned_by BIGINT);
+CREATE INDEX IF NOT EXISTS admin_logs_ts ON admin_logs (ts DESC);
 """
 
 

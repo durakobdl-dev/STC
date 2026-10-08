@@ -24,6 +24,7 @@ import maintenance
 import fuel_card
 import loans
 import contracts
+import admin
 from game import dur, esc, money
 
 router = Router()
@@ -1055,46 +1056,254 @@ async def help_view(call: CallbackQuery):
 
 
 # ---------- админ ----------
+# ---------- админ-панель ----------
 @router.callback_query(F.data == "admin")
-async def admin_panel(call: CallbackQuery):
-    uid = call.from_user.id
-    p = await get_player(uid)
+async def admin_menu(call: CallbackQuery):
+    """Главное меню админ-панели"""
+    try:
+        uid = call.from_user.id
+        # Проверяем админ статус
+        from config import is_admin
+        username = call.from_user.username or ""
+        if not is_admin(uid, username):
+            await call.answer("❌ Доступ запрещен", show_alert=True)
+            return
 
-    lines = ["⚙️ <b>Админ-панель</b>\n"]
-    lines.append(f"ID: {uid}")
-    lines.append(f"Имя: {esc(p['name'])}")
-    lines.append(f"Баланс: {money(p['money'])}")
-    lines.append(f"Уровень: {game.level(p['xp'])}")
-    lines.append(f"Фур: {await db.pool.fetchval('SELECT count(*) FROM trucks WHERE owner=$1', uid)}")
-    lines.append("")
+        lines = ["⚙️ <b>АДМИН-ПАНЕЛЬ</b>\n"]
 
-    rows = [[("💰 +1M", "admin_money"), ("⭐ +50 XP", "admin_xp")],
-            [("🚚 +Фура", "admin_truck")],
-            [("⬅️ Меню", "menu")]]
+        stats = await admin.get_stats()
+        lines.append(f"📊 <b>Статистика:</b>")
+        lines.append(f"• Игроков: {stats['players']}")
+        lines.append(f"• Фур: {stats['trucks']}")
+        lines.append(f"• Рейсов выполнено: {stats['total_trips']}")
+        lines.append(f"• Активных рейсов: {stats['active_trips']}")
+        lines.append(f"• Общий баланс: {money(stats['total_money'])}")
+        lines.append("")
 
-    await show(call, "\n".join(lines), kb(rows))
+        rows = [[("📊 Статистика", "admin:stats"), ("📋 Логи", "admin:logs")],
+                [("🚫 Бан/Разбан", "admin:ban"), ("💳 Очистить долг", "admin:debt")],
+                [("💰 Выдать деньги", "admin:give_money"), ("🚚 Выдать фуру", "admin:give_truck")],
+                [("⬅️ Меню", "menu")]]
+
+        await show(call, "\n".join(lines), kb(rows))
+    except Exception as e:
+        logging.exception("admin_menu error")
+        await call.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
 
 
-@router.callback_query(F.data.startswith("admin_"))
-async def admin_action(call: CallbackQuery):
-    uid = call.from_user.id
-    action = call.data.split("_")[1]
+@router.callback_query(F.data == "admin:stats")
+async def admin_stats(call: CallbackQuery):
+    """Показать статистику"""
+    try:
+        uid = call.from_user.id
+        from config import is_admin
+        username = call.from_user.username or ""
+        if not is_admin(uid, username):
+            await call.answer("❌ Доступ запрещен", show_alert=True)
+            return
 
-    async with db.pool.acquire() as c:
-        async with c.transaction():
-            if action == "money":
-                await c.execute("UPDATE players SET money = money + 1000000 WHERE id=$1", uid)
-            elif action == "xp":
-                await c.execute("UPDATE players SET xp = xp + 50 WHERE id=$1", uid)
-            elif action == "truck":
-                p = await c.fetchrow("SELECT home_city FROM players WHERE id=$1", uid)
-                b = BRANDS[0]
-                await c.execute(
-                    """INSERT INTO trucks (owner, brand, model, year, mileage, capacity, consumption, speed, city)
-                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)""",
-                    uid, b[0], b[1], b[2], 0, b[3], b[4], b[5], p["home_city"])
+        stats = await admin.get_stats()
 
-    await admin_panel(call)
+        lines = ["📊 <b>Статистика игры</b>\n"]
+        lines.append(f"Всего игроков: <b>{stats['players']}</b>")
+        lines.append(f"Всего фур: <b>{stats['trucks']}</b>")
+        lines.append(f"Всего рейсов: <b>{stats['total_trips']}</b>")
+        lines.append(f"Активных рейсов: <b>{stats['active_trips']}</b>")
+        lines.append(f"Всего км пройдено: <b>{stats['total_km']:,}</b>".replace(",", " "))
+        lines.append(f"Общий баланс всех: <b>{money(stats['total_money'])}</b>")
+        lines.append("")
+        lines.append("Средние показатели:")
+        avg_money = stats['total_money'] // max(1, stats['players'])
+        avg_trips = stats['total_trips'] // max(1, stats['players'])
+        lines.append(f"• На игрока денег: {money(avg_money)}")
+        lines.append(f"• На игрока рейсов: {avg_trips}")
+
+        rows = [[("⬅️ Меню админа", "admin")]]
+        await show(call, "\n".join(lines), kb(rows))
+    except Exception as e:
+        logging.exception("admin_stats error")
+        await call.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
+
+
+@router.callback_query(F.data == "admin:logs")
+async def admin_logs_view(call: CallbackQuery):
+    """Показать логи админ действий"""
+    try:
+        uid = call.from_user.id
+        from config import is_admin
+        username = call.from_user.username or ""
+        if not is_admin(uid, username):
+            await call.answer("❌ Доступ запрещен", show_alert=True)
+            return
+
+        logs = await admin.get_logs(15)
+
+        lines = ["📋 <b>Логи админ действий</b>\n"]
+        if logs:
+            for log in logs:
+                action = log['action']
+                detail = log['details'] or ""
+                ts = log['ts'].strftime("%Y-%m-%d %H:%M")
+                target = f"(ID {log['target_id']})" if log['target_id'] else ""
+                lines.append(f"• {action} {target} {detail}")
+                lines.append(f"  {ts}")
+        else:
+            lines.append("Нет логов")
+
+        rows = [[("⬅️ Меню админа", "admin")]]
+        await show(call, "\n".join(lines), kb(rows))
+    except Exception as e:
+        logging.exception("admin_logs_view error")
+        await call.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
+
+
+@router.callback_query(F.data == "admin:ban")
+async def admin_ban_menu(call: CallbackQuery):
+    """Меню бан/разбана"""
+    try:
+        uid = call.from_user.id
+        from config import is_admin
+        username = call.from_user.username or ""
+        if not is_admin(uid, username):
+            await call.answer("❌ Доступ запрещен", show_alert=True)
+            return
+
+        lines = ["🚫 <b>Бан/Разбан игроков</b>\n"]
+        lines.append("Введите ID или имя игрока:")
+
+        rows = [[("⬅️ Меню админа", "admin")]]
+        # Используем состояние для ввода
+        await show(call, "\n".join(lines), kb(rows))
+
+        # Надо реализовать через состояния или через inline ввод
+        # На данный момент просто показываем сообщение
+        # TODO: Добавить FSM для ввода ID
+    except Exception as e:
+        logging.exception("admin_ban_menu error")
+        await call.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
+
+
+@router.callback_query(F.data == "admin:debt")
+async def admin_clear_debt_menu(call: CallbackQuery):
+    """Меню очистки долга"""
+    try:
+        uid = call.from_user.id
+        from config import is_admin
+        username = call.from_user.username or ""
+        if not is_admin(uid, username):
+            await call.answer("❌ Доступ запрещен", show_alert=True)
+            return
+
+        lines = ["💳 <b>Очистить налоговый долг</b>\n"]
+        lines.append("Введите ID игрока:")
+
+        rows = [[("⬅️ Меню админа", "admin")]]
+        await show(call, "\n".join(lines), kb(rows))
+    except Exception as e:
+        logging.exception("admin_clear_debt_menu error")
+        await call.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
+
+
+@router.callback_query(F.data == "admin:give_money")
+async def admin_give_money_menu(call: CallbackQuery):
+    """Меню выдачи денег"""
+    try:
+        uid = call.from_user.id
+        from config import is_admin
+        username = call.from_user.username or ""
+        if not is_admin(uid, username):
+            await call.answer("❌ Доступ запрещен", show_alert=True)
+            return
+
+        lines = ["💰 <b>Выдать деньги</b>\n"]
+        lines.append("Введите ID игрока и сумму (через пробел):")
+        lines.append("Например: 123456789 1000000")
+
+        rows = [[("⬅️ Меню админа", "admin")]]
+        await show(call, "\n".join(lines), kb(rows))
+    except Exception as e:
+        logging.exception("admin_give_money_menu error")
+        await call.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
+
+
+@router.callback_query(F.data == "admin:give_truck")
+async def admin_give_truck_menu(call: CallbackQuery):
+    """Меню выдачи фуры"""
+    try:
+        uid = call.from_user.id
+        from config import is_admin
+        username = call.from_user.username or ""
+        if not is_admin(uid, username):
+            await call.answer("❌ Доступ запрещен", show_alert=True)
+            return
+
+        lines = ["🚚 <b>Выдать фуру</b>\n"]
+        lines.append("Доступные модели:")
+        for i, b in enumerate(BRANDS, 1):
+            lines.append(f"{i}. {b[0]} {b[1]}")
+        lines.append("")
+        lines.append("Введите ID игрока и номер модели (через пробел):")
+        lines.append("Например: 123456789 1")
+
+        rows = [[("⬅️ Меню админа", "admin")]]
+        await show(call, "\n".join(lines), kb(rows))
+    except Exception as e:
+        logging.exception("admin_give_truck_menu error")
+        await call.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
+
+
+@router.message()
+async def admin_message_handler(m: Message):
+    """Обработчик сообщений для админ операций"""
+    try:
+        uid = m.from_user.id
+        from config import is_admin
+        username = m.from_user.username or ""
+        if not is_admin(uid, username):
+            return
+
+        text = m.text.strip()
+        if not text:
+            return
+
+        # Обработка команд админа
+        # TODO: Улучшить с помощью FSM состояний
+        parts = text.split()
+
+        if len(parts) >= 2:
+            try:
+                player_id = int(parts[0])
+
+                if len(parts) == 2 and parts[1].isdigit():
+                    # Выдать деньги или фуру
+                    amount = int(parts[1])
+                    if amount > 10_000_000:
+                        await m.answer("❌ Слишком много денег (макс 10M)")
+                        return
+
+                    err = await admin.give_money(uid, player_id, amount)
+                    if err:
+                        await m.answer(f"❌ {err}")
+                    else:
+                        await m.answer(f"✅ Выдано {money(amount)} игроку ID {player_id}")
+
+                elif len(parts) >= 3:
+                    # Возможно выдача фуры
+                    try:
+                        truck_idx = int(parts[1]) - 1
+                        if 0 <= truck_idx < len(BRANDS):
+                            brand, model = BRANDS[truck_idx][0], BRANDS[truck_idx][1]
+                            err = await admin.give_truck(uid, player_id, brand, model)
+                            if err:
+                                await m.answer(f"❌ {err}")
+                            else:
+                                await m.answer(f"✅ Выдана фура {brand} {model} игроку ID {player_id}")
+                    except:
+                        pass
+            except ValueError:
+                pass
+    except Exception as e:
+        logging.exception("admin_message_handler error")
 
 
 # ---------- запуск ----------

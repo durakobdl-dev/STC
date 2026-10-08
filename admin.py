@@ -1,245 +1,145 @@
-"""Админ-меню. Доступ у юзернеймов из переменной окружения ADMIN_USERNAMES (через запятую)."""
-import logging
-from datetime import timedelta
-
-from aiogram import F, Router
-from aiogram.filters import Command
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
-
+"""Админ-панель"""
 import db
-import dealer
-from config import LICENSE_DAYS, is_admin as _is_admin
-from data import BRANDS, CITIES
-from util import esc, money, now
-
-router = Router()
-STATE = {}   # id админа -> {"act": ..., "target": ...}: ждём от него следующее сообщение
+from util import money, now
 
 
-def is_admin(user):
-    return _is_admin(user.id, user.username)
-
-
-def tag(p):
-    """Как показывать игрока: @username, а если его нет, то ID."""
-    return f"@{esc(p['username'])}" if p["username"] else f"ID <code>{p['id']}</code>"
-
-
-def kb(rows):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=t, callback_data=d) for t, d in row] for row in rows])
-
-
-async def ashow(call: CallbackQuery, text, markup):
-    msg = call.message
-    try:
-        if msg.photo:
-            await msg.delete()
-            await msg.answer(text, reply_markup=markup)
-        else:
-            await msg.edit_text(text, reply_markup=markup)
-    except Exception as e:      # «message is not modified» и т.п.
-        if "not modified" not in str(e):
-            logging.exception("admin show failed")
-    try:
-        await call.answer()
-    except Exception:
-        pass
-
-
-async def deny(call: CallbackQuery):
-    await call.answer("Нет доступа", show_alert=True)
-
-
-def parse_amount(s):
-    """500000, -2000, 500к, 1.5м, 2m."""
-    s = s.lower().replace("_", "").replace(" ", "").replace(",", ".")
-    mult = 1
-    if s.endswith(("к", "k")):
-        mult, s = 1_000, s[:-1]
-    elif s.endswith(("м", "m")):
-        mult, s = 1_000_000, s[:-1]
-    return int(float(s) * mult)
-
-
-async def find_player(token, me):
-    """Игрок по @юзернейму; «me»/«я» — сам админ; чистое число тоже сработает как Telegram ID."""
-    token = token.strip().lstrip("@").lower()
-    if token in ("me", "я"):
-        return await db.pool.fetchrow("SELECT * FROM players WHERE id=$1", me)
-    if token.isdigit():
-        return await db.pool.fetchrow("SELECT * FROM players WHERE id=$1", int(token))
-    return await db.pool.fetchrow("SELECT * FROM players WHERE lower(username)=$1", token)
-
-
-async def notify(bot, uid, text):
-    try:
-        await bot.send_message(uid, text)
-    except Exception:
-        logging.warning("admin notify failed for %s", uid)
-
-
-# ---------- главная страница ----------
-async def admin_page():
-    n = await db.pool.fetchval("SELECT count(*) FROM players")
-    total = await db.pool.fetchval("SELECT coalesce(sum(money),0) FROM players")
-    trucks = await db.pool.fetchval("SELECT count(*) FROM trucks")
-    text = (f"🛠 <b>Админ-меню</b>\n\n👥 Игроков: {n}\n🚚 Фур в игре: {trucks}\n"
-            f"💰 Денег у всех игроков: {money(total)}\n\nЧто сделать?")
-    markup = kb([[("💰 Выдать / снять деньги", "adm:money")],
-                 [("🚚 Выдать фуру", "adm:truck")],
-                 [("🪪 Выдать лицензии на все города", "adm:lic")],
-                 [("👥 Список игроков", "adm:players")],
-                 [("⬅️ Меню", "menu")]])
-    return text, markup
-
-
-@router.message(Command("admin"))
-async def cmd_admin(m: Message):
-    if not is_admin(m.from_user):
-        return
-    STATE.pop(m.from_user.id, None)
-    text, markup = await admin_page()
-    await m.answer(text, reply_markup=markup)
-
-
-@router.callback_query(F.data == "adm")
-async def adm_home(call: CallbackQuery):
-    if not is_admin(call.from_user):
-        return await deny(call)
-    STATE.pop(call.from_user.id, None)
-    text, markup = await admin_page()
-    await ashow(call, text, markup)
-
-
-# ---------- деньги ----------
-@router.callback_query(F.data == "adm:money")
-async def adm_money(call: CallbackQuery):
-    if not is_admin(call.from_user):
-        return await deny(call)
-    STATE[call.from_user.id] = {"act": "money"}
-    await ashow(call, "💰 <b>Деньги игроку</b>\n\nОтправьте сообщением: <code>@юзернейм сумма</code>\n"
-                      "Примеры:\n<code>@ivan 500000</code>\n<code>@ivan 2м</code> (2 млн)\n"
-                      "<code>@ivan -50к</code> (списать 50 тыс.)\n<code>me 1м</code> (себе)\n\n"
-                      "Игрок должен был хотя бы раз открыть бота после обновления. Список: «👥 Список игроков».",
-                kb([[("⬅️ Админ-меню", "adm")]]))
-
-
-# ---------- фуры ----------
-@router.callback_query(F.data == "adm:truck")
-async def adm_truck(call: CallbackQuery):
-    if not is_admin(call.from_user):
-        return await deny(call)
-    STATE[call.from_user.id] = {"act": "truck"}
-    await ashow(call, "🚚 <b>Выдать фуру</b>\n\nОтправьте сообщением @юзернейм игрока (или <code>me</code> для себя). "
-                      "Фура будет новая, в его домашнем городе.", kb([[("⬅️ Админ-меню", "adm")]]))
-
-
-@router.callback_query(F.data.startswith("adm:t:"))
-async def adm_truck_give(call: CallbackQuery):
-    if not is_admin(call.from_user):
-        return await deny(call)
-    _, _, target, j = call.data.split(":")
-    target, b = int(target), BRANDS[int(j)]
-    p = await db.pool.fetchrow("SELECT * FROM players WHERE id=$1", target)
-    if not p:
-        return await call.answer("Игрок не найден", show_alert=True)
-    if await db.pool.fetchval("SELECT count(*) FROM trucks WHERE owner=$1", target) >= dealer.MAX_TRUCKS:
-        return await call.answer(f"У игрока уже максимум фур ({dealer.MAX_TRUCKS})", show_alert=True)
+async def log_action(admin_id, action, target_id=None, details=None):
+    """Логирует админ действие"""
     await db.pool.execute(
-        """INSERT INTO trucks (owner, brand, model, year, mileage, capacity, consumption, speed, city, km_since_to)
-           VALUES ($1,$2,$3,$4,0,$5,$6,$7,$8,0)""",
-        target, b[0], b[1], dealer.NOW_YEAR, b[3], b[4], b[5], p["home_city"])
-    await notify(call.bot, target, f"🎁 Администрация выдала вам фуру: {b[0]} {b[1]} (новая) в городе {p['home_city']}.")
-    STATE.pop(call.from_user.id, None)
-    await ashow(call, f"✅ Выдана {b[0]} {b[1]} игроку {esc(p['name'])} ({tag(p)}), город {esc(p['home_city'])}.",
-                kb([[("🚚 Ещё фуру", "adm:truck")], [("⬅️ Админ-меню", "adm")]]))
+        "INSERT INTO admin_logs (admin_id, action, target_id, details) VALUES ($1,$2,$3,$4)",
+        admin_id, action, target_id, details)
 
 
-# ---------- лицензии ----------
-@router.callback_query(F.data == "adm:lic")
-async def adm_lic(call: CallbackQuery):
-    if not is_admin(call.from_user):
-        return await deny(call)
-    STATE[call.from_user.id] = {"act": "lic"}
-    await ashow(call, f"🪪 <b>Лицензии</b>\n\nОтправьте @юзернейм игрока (или <code>me</code>): "
-                      f"получит лицензии на все города на {LICENSE_DAYS} дней.", kb([[("⬅️ Админ-меню", "adm")]]))
+async def get_stats():
+    """Получить общую статистику"""
+    total_players = await db.pool.fetchval("SELECT count(*) FROM players")
+    total_money = await db.pool.fetchval("SELECT coalesce(sum(money),0) FROM players")
+    total_trips = await db.pool.fetchval("SELECT coalesce(sum(trips_done),0) FROM players")
+    total_km = await db.pool.fetchval("SELECT coalesce(sum(total_km),0) FROM players")
+    total_trucks = await db.pool.fetchval("SELECT count(*) FROM trucks")
+    active_trips = await db.pool.fetchval("SELECT count(*) FROM trips WHERE settled=FALSE")
+    return {
+        "players": total_players,
+        "total_money": total_money,
+        "total_trips": total_trips,
+        "total_km": total_km,
+        "trucks": total_trucks,
+        "active_trips": active_trips,
+    }
 
 
-# ---------- игроки ----------
-@router.callback_query(F.data == "adm:players")
-async def adm_players(call: CallbackQuery):
-    if not is_admin(call.from_user):
-        return await deny(call)
-    rows = await db.pool.fetch(
-        """SELECT p.id, p.username, p.name, p.money, p.home_city, (SELECT count(*) FROM trucks t WHERE t.owner=p.id) AS n
-           FROM players p ORDER BY p.money DESC LIMIT 25""")
-    lines = ["👥 <b>Игроки</b> (по деньгам, до 25)\n"]
-    for r in rows:
-        lines.append(f"{tag(r)} · {esc(r['name'])} · {money(r['money'])} · 🚚 {r['n']} · {esc(r['home_city'])}")
-    if not rows:
-        lines.append("Пока никого.")
-    lines.append("\nУ кого вместо @юзернейма показан ID: игрок не заходил в бота после обновления или у него нет юзернейма в Telegram. ID тоже работает.")
-    await ashow(call, "\n".join(lines), kb([[("⬅️ Админ-меню", "adm")]]))
+async def get_logs(limit=10):
+    """Получить логи админ действий"""
+    return await db.pool.fetch(
+        """SELECT id, admin_id, action, target_id, details, ts 
+           FROM admin_logs ORDER BY ts DESC LIMIT $1""", limit)
 
 
-# ---------- ввод текста админом ----------
-def waiting(m: Message):
-    return bool(m.text) and is_admin(m.from_user) and m.from_user.id in STATE
-
-
-@router.message(waiting)
-async def admin_input(m: Message):
-    uid = m.from_user.id
-    st = STATE[uid]
-    parts = m.text.split()
-    back = kb([[("⬅️ Админ-меню", "adm")]])
+async def find_player(query: str):
+    """Найти игрока по ID или имени"""
     try:
-        if st["act"] == "money":
-            if len(parts) != 2:
-                raise ValueError("нужно два значения: @юзернейм и сумма")
-            p = await find_player(parts[0], uid)
-            if not p:
-                return await m.answer("Игрок не найден. Проверьте @юзернейм (он должен был открыть бота после обновления) и отправьте ещё раз.", reply_markup=back)
-            amount = parse_amount(parts[1])
-            new = await db.pool.fetchval(
-                "UPDATE players SET money = money + $2 WHERE id=$1 RETURNING money", p["id"], amount)
-            word = "начислила" if amount >= 0 else "списала"
-            await notify(m.bot, p["id"], f"🏛 Администрация {word} {money(abs(amount))}. Баланс: {money(new)}")
-            STATE.pop(uid, None)
-            await m.answer(f"✅ {esc(p['name'])} ({tag(p)}): {'+' if amount >= 0 else '−'}{money(abs(amount))}\n"
-                           f"Баланс теперь: <b>{money(new)}</b>",
-                           reply_markup=kb([[("💰 Ещё", "adm:money")], [("⬅️ Админ-меню", "adm")]]))
-        elif st["act"] == "truck":
-            p = await find_player(parts[0], uid)
-            if not p:
-                return await m.answer("Игрок не найден. Проверьте @юзернейм (он должен был открыть бота после обновления) и отправьте ещё раз.", reply_markup=back)
-            rows = [[(f"{b[0]} {b[1]} · {b[3]} т · {b[5]} км/ч", f"adm:t:{p['id']}:{j}")] for j, b in enumerate(BRANDS)]
-            rows.append([("⬅️ Админ-меню", "adm")])
-            STATE.pop(uid, None)
-            await m.answer(f"Какую фуру выдать игроку {esc(p['name'])}? (город: {esc(p['home_city'])})",
-                           reply_markup=kb(rows))
-        elif st["act"] == "lic":
-            p = await find_player(parts[0], uid)
-            if not p:
-                return await m.answer("Игрок не найден. Проверьте @юзернейм (он должен был открыть бота после обновления) и отправьте ещё раз.", reply_markup=back)
-            async with db.pool.acquire() as c:
-                async with c.transaction():
-                    for city in CITIES:
-                        cur = await c.fetchval("SELECT expires_at FROM licenses WHERE owner=$1 AND city=$2", p["id"], city)
-                        base = max(now(), cur) if cur else now()
-                        await c.execute(
-                            """INSERT INTO licenses (owner, city, expires_at) VALUES ($1,$2,$3)
-                               ON CONFLICT (owner, city) DO UPDATE SET expires_at=$3""",
-                            p["id"], city, base + timedelta(days=LICENSE_DAYS))
-                    await c.execute("DELETE FROM orders WHERE owner=$1", p["id"])
-            await notify(m.bot, p["id"], f"🎁 Администрация выдала вам лицензии на все города на {LICENSE_DAYS} дней.")
-            STATE.pop(uid, None)
-            await m.answer(f"✅ {esc(p['name'])} ({tag(p)}) получил лицензии на все города.",
-                           reply_markup=kb([[("🪪 Ещё", "adm:lic")], [("⬅️ Админ-меню", "adm")]]))
-    except ValueError as e:
-        await m.answer("⚠️ Не понял формат. Нужно: @юзернейм и сумма, например <code>@ivan 500000</code> "
-                       "(или <code>me 1м</code>). Попробуйте ещё раз или вернитесь в меню.", reply_markup=back)
-    except Exception:
-        logging.exception("admin input failed")
-        await m.answer("⚠️ Что-то пошло не так, подробности в логах.", reply_markup=back)
+        uid = int(query)
+        return await db.pool.fetchrow("SELECT * FROM players WHERE id=$1", uid)
+    except ValueError:
+        return await db.pool.fetchrow("SELECT * FROM players WHERE lower(name) LIKE lower($1)", f"%{query}%")
+
+
+async def give_money(admin_id, player_id, amount):
+    """Выдать деньги игроку"""
+    err = await db.pool.fetchval("SELECT id FROM player_bans WHERE player_id=$1", player_id)
+    if err:
+        return "Игрок забанен"
+    
+    p = await db.pool.fetchrow("SELECT * FROM players WHERE id=$1", player_id)
+    if not p:
+        return "Игрок не найден"
+    
+    await db.pool.execute("UPDATE players SET money = money + $2 WHERE id=$1", player_id, amount)
+    await log_action(admin_id, "give_money", player_id, f"{money(amount)}")
+    return None
+
+
+async def give_truck(admin_id, player_id, brand, model):
+    """Выдать фуру игроку"""
+    err = await db.pool.fetchval("SELECT id FROM player_bans WHERE player_id=$1", player_id)
+    if err:
+        return "Игрок забанен"
+    
+    p = await db.pool.fetchrow("SELECT * FROM players WHERE id=$1", player_id)
+    if not p:
+        return "Игрок не найден"
+    
+    # Находим спецификацию фуры
+    from data import BRANDS, TO_INTERVAL
+    b = next((x for x in BRANDS if x[0] == brand and x[1] == model), None)
+    if not b:
+        return "Неизвестная модель фуры"
+    
+    await db.pool.execute(
+        """INSERT INTO trucks (owner, brand, model, year, mileage, capacity, consumption, speed, city)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)""",
+        player_id, b[0], b[1], b[2], 0, b[3], b[4], b[5], p["home_city"])
+    await log_action(admin_id, "give_truck", player_id, f"{brand} {model}")
+    return None
+
+
+async def ban_player(admin_id, player_id, reason):
+    """Забанить игрока"""
+    p = await db.pool.fetchrow("SELECT * FROM players WHERE id=$1", player_id)
+    if not p:
+        return "Игрок не найден"
+    
+    existing = await db.pool.fetchval("SELECT id FROM player_bans WHERE player_id=$1", player_id)
+    if existing:
+        return "Игрок уже забанен"
+    
+    await db.pool.execute(
+        "INSERT INTO player_bans (player_id, reason, banned_by) VALUES ($1,$2,$3)",
+        player_id, reason, admin_id)
+    await log_action(admin_id, "ban_player", player_id, reason)
+    return None
+
+
+async def unban_player(admin_id, player_id):
+    """Разбанить игрока"""
+    result = await db.pool.fetchval("DELETE FROM player_bans WHERE player_id=$1 RETURNING id", player_id)
+    if not result:
+        return "Игрок не забанен"
+    
+    await log_action(admin_id, "unban_player", player_id)
+    return None
+
+
+async def is_banned(player_id):
+    """Проверить забанен ли игрок"""
+    return await db.pool.fetchval("SELECT id FROM player_bans WHERE player_id=$1", player_id) is not None
+
+
+async def clear_debt(admin_id, player_id):
+    """Очистить налоговый долг"""
+    p = await db.pool.fetchrow("SELECT * FROM players WHERE id=$1", player_id)
+    if not p:
+        return "Игрок не найден"
+    
+    result = await db.pool.fetchval(
+        "SELECT coalesce(sum(due),0) FROM tax_bills WHERE owner=$1 AND paid_at IS NULL", player_id)
+    
+    if result > 0:
+        await db.pool.execute(
+            "UPDATE tax_bills SET paid_at=now() WHERE owner=$1 AND paid_at IS NULL", player_id)
+        await db.pool.execute("UPDATE players SET arrested=FALSE WHERE id=$1", player_id)
+        await log_action(admin_id, "clear_debt", player_id, f"{money(result)}")
+        return f"Долг очищен: {money(result)}"
+    return "Нет задолженности"
+
+
+async def clear_loans(admin_id, player_id):
+    """Очистить кредиты"""
+    result = await db.pool.fetchval(
+        "SELECT coalesce(sum(remaining),0) FROM loans WHERE owner=$1", player_id)
+    
+    if result > 0:
+        await db.pool.execute("DELETE FROM loans WHERE owner=$1", player_id)
+        await log_action(admin_id, "clear_loans", player_id, f"{money(result)}")
+        return f"Кредиты очищены: {money(result)}"
+    return "Нет активных кредитов"
