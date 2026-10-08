@@ -25,8 +25,19 @@ def _make_contract_order(city, licensed):
         km = dist(city, to)
         label = to
     else:
-        label, km = random.choice(SUBURBAN[city])
-        to = city
+        # Пригородные маршруты - если города нет в SUBURBAN, делаем перегон
+        if city in SUBURBAN:
+            label, km = random.choice(SUBURBAN[city])
+            to = city
+        else:
+            # Нет пригородных маршрутов для этого города, ищем межгородский
+            if inter:
+                to = random.choice(inter)
+                km = dist(city, to)
+                label = to
+            else:
+                # Нет доступных маршрутов вообще - возвращаем None
+                return None
     cargo = random.choice(list(CARGO))
     tons = random.randint(12, 24)      # крупные клиенты грузят много
     return to, label, cargo, tons, km
@@ -41,7 +52,10 @@ async def available_contracts(uid, city, licensed):
     for client, bonus in CONTRACT_CLIENTS:
         if client in taken_clients:
             continue
-        to, label, cargo, tons, km = _make_contract_order(city, licensed)
+        order_data = _make_contract_order(city, licensed)
+        if order_data is None:
+            continue
+        to, label, cargo, tons, km = order_data
         base_rate = CARGO[cargo]
         price_per_trip = max(30_000, int(km * base_rate * (0.8 + tons / 40) * bonus / 100) * 100)
         result.append({

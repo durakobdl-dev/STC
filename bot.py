@@ -213,29 +213,33 @@ async def menu(call: CallbackQuery):
 # ---------- быстрый доступ к заказам ----------
 @router.callback_query(F.data == "orders")
 async def orders_quick(call: CallbackQuery):
-    uid = call.from_user.id
-    lic = await game.licensed_cities(uid)
-    trucks = await db.pool.fetch("SELECT id, brand, model, city FROM trucks WHERE owner=$1 AND NOT busy", uid)
+    try:
+        uid = call.from_user.id
+        lic = await game.licensed_cities(uid)
+        trucks = await db.pool.fetch("SELECT id, brand, model, city FROM trucks WHERE owner=$1 AND NOT busy", uid)
 
-    # Отфильтруем те, что на ТО
-    trucks_by_city = {}
-    for t in trucks:
-        full = await db.pool.fetchrow("SELECT * FROM trucks WHERE id=$1", t["id"])
-        if not maintenance.in_service(full):
-            if t["city"] not in trucks_by_city:
-                trucks_by_city[t["city"]] = []
-            trucks_by_city[t["city"]].append(t)
+        # Отфильтруем те, что на ТО
+        trucks_by_city = {}
+        for t in trucks:
+            full = await db.pool.fetchrow("SELECT * FROM trucks WHERE id=$1", t["id"])
+            if not maintenance.in_service(full):
+                if t["city"] not in trucks_by_city:
+                    trucks_by_city[t["city"]] = []
+                trucks_by_city[t["city"]].append(t)
 
-    if not trucks_by_city:
-        await call.answer("Нет свободных фур", show_alert=True)
-        return
+        if not trucks_by_city:
+            await call.answer("Нет свободных фур", show_alert=True)
+            return
 
-    rows = []
-    for city in sorted(trucks_by_city.keys()):
-        count = len(trucks_by_city[city])
-        rows.append([(f"{city} ({count} свобод.)", f"ordcity:{city}")])
-    rows.append([("⬅️ Меню", "menu")])
-    await show(call, "📦 <b>Выберите город:</b>", kb(rows))
+        rows = []
+        for city in sorted(trucks_by_city.keys()):
+            count = len(trucks_by_city[city])
+            rows.append([(f"{city} ({count} свобод.)", f"ordcity:{city}")])
+        rows.append([("⬅️ Меню", "menu")])
+        await show(call, "📦 <b>Выберите город:</b>", kb(rows))
+    except Exception as e:
+        logging.exception("orders_quick error")
+        await call.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("ordcity:"))
@@ -856,102 +860,118 @@ async def top(call: CallbackQuery):
 # ---------- контракты ----------
 @router.callback_query(F.data == "contracts")
 async def contracts_list(call: CallbackQuery):
-    uid = call.from_user.id
-    active = await contracts.active_contracts(uid)
-    lic = await game.licensed_cities(uid)
-    trucks = await db.pool.fetch("SELECT id, city FROM trucks WHERE owner=$1 AND NOT busy", uid)
+    try:
+        uid = call.from_user.id
+        active = await contracts.active_contracts(uid)
+        lic = await game.licensed_cities(uid)
+        trucks = await db.pool.fetch("SELECT id, city FROM trucks WHERE owner=$1 AND NOT busy", uid)
 
-    # Города, где есть свободные фуры
-    cities_with_trucks = set()
-    for t in trucks:
-        full = await db.pool.fetchrow("SELECT * FROM trucks WHERE id=$1", t["id"])
-        if not maintenance.in_service(full):
-            cities_with_trucks.add(t["city"])
+        # Города, где есть свободные фуры
+        cities_with_trucks = set()
+        for t in trucks:
+            full = await db.pool.fetchrow("SELECT * FROM trucks WHERE id=$1", t["id"])
+            if not maintenance.in_service(full):
+                cities_with_trucks.add(t["city"])
 
-    lines = ["📋 <b>Контракты</b>\n"]
-    rows = []
+        lines = ["📋 <b>Контракты</b>\n"]
+        rows = []
 
-    if active:
-        lines.append("<b>Текущие контракты:</b>")
-        for c in active:
-            trips_left = c["trips_total"] - c["trips_done"]
-            lines.append(f"• {esc(c['client'])}: {c['cargo']}")
-            lines.append(f"  {c['from_city']} → {c['to_city']} · {trips_left}/{c['trips_total']} рейсов")
-            lines.append(f"  {money(c['price_per_trip'])} за рейс")
-        lines.append("")
+        if active:
+            lines.append("<b>Текущие контракты:</b>")
+            for c in active:
+                trips_left = c["trips_total"] - c["trips_done"]
+                lines.append(f"• {esc(c['client'])}: {c['cargo']}")
+                lines.append(f"  {c['from_city']} → {c['to_city']} · {trips_left}/{c['trips_total']} рейсов")
+                lines.append(f"  {money(c['price_per_trip'])} за рейс")
+            lines.append("")
 
-    if cities_with_trucks:
-        lines.append("<b>Доступные контракты:</b>")
-        for city in sorted(cities_with_trucks):
-            rows.append([(f"В {city}", f"contcity:{city}")])
-    else:
-        lines.append("Нет свободных фур для новых контрактов.")
+        if cities_with_trucks:
+            lines.append("<b>Доступные контракты:</b>")
+            for city in sorted(cities_with_trucks):
+                rows.append([(f"В {city}", f"contcity:{city}")])
+        else:
+            lines.append("Нет свободных фур для новых контрактов.")
 
-    rows.append([("⬅️ Меню", "menu")])
-    await show(call, "\n".join(lines), kb(rows))
+        rows.append([("⬅️ Меню", "menu")])
+        await show(call, "\n".join(lines), kb(rows))
+    except Exception as e:
+        logging.exception("contracts_list error")
+        await call.answer(f"❌ Ошибка контрактов: {str(e)[:100]}", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("contcity:"))
 async def contracts_by_city(call: CallbackQuery):
-    city = call.data.split(":", 1)[1]
-    uid = call.from_user.id
-    lic = await game.licensed_cities(uid)
-    avail = await contracts.available_contracts(uid, city, lic)
+    try:
+        city = call.data.split(":", 1)[1]
+        uid = call.from_user.id
+        lic = await game.licensed_cities(uid)
+        avail = await contracts.available_contracts(uid, city, lic)
 
-    lines = [f"📋 <b>Контракты в {city}</b>\n"]
-    rows = []
+        lines = [f"📋 <b>Контракты в {city}</b>\n"]
+        rows = []
 
-    if avail:
-        for i, c in enumerate(avail, 1):
-            lines.append(f"{i}. {esc(c['client'])}: {c['cargo']}")
-            lines.append(f"   {c['to_city']} · {c['tons']} т · {c['km']} км")
-            lines.append(f"   {money(c['price_per_trip'])} за рейс × 7 рейсов")
-            rows.append([(f"Взять {i}", f"contract:{city}:{c['client']}")])
-    else:
-        lines.append("Нет доступных контрактов в этом городе. Загляните позже.")
+        if avail:
+            for i, c in enumerate(avail, 1):
+                lines.append(f"{i}. {esc(c['client'])}: {c['cargo']}")
+                lines.append(f"   {c['to_city']} · {c['tons']} т · {c['km']} км")
+                lines.append(f"   {money(c['price_per_trip'])} за рейс × 7 рейсов")
+                rows.append([(f"Взять {i}", f"contract:{city}:{c['client']}")])
+        else:
+            lines.append("Нет доступных контрактов в этом городе. Загляните позже.")
 
-    rows.append([("⬅️ Города", "contracts")])
-    await show(call, "\n".join(lines), kb(rows))
+        rows.append([("⬅️ Города", "contracts")])
+        await show(call, "\n".join(lines), kb(rows))
+    except Exception as e:
+        logging.exception("contracts_by_city error")
+        await call.answer(f"❌ Ошибка загрузки контрактов: {str(e)[:100]}", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("contract:"))
 async def contract_take(call: CallbackQuery):
-    uid = call.from_user.id
-    parts = call.data.split(":", 2)
-    city = parts[1]
-    client_name = parts[2]
+    try:
+        uid = call.from_user.id
+        parts = call.data.split(":", 2)
+        city = parts[1]
+        client_name = parts[2]
 
-    lic = await game.licensed_cities(uid)
-    err = await contracts.take_contract(uid, city, lic, client_name)
-    if err:
-        await call.answer(err, show_alert=True)
-        return
-    await call.answer("Контракт принят!", show_alert=True)
-    await contracts_list(call)
+        lic = await game.licensed_cities(uid)
+        err = await contracts.take_contract(uid, city, lic, client_name)
+        if err:
+            await call.answer(err, show_alert=True)
+            return
+        await call.answer("Контракт принят!", show_alert=True)
+        await contracts_list(call)
+    except Exception as e:
+        logging.exception("contract_take error")
+        await call.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
 
 
 # ---------- топливные карты ----------
 @router.callback_query(F.data == "fuel_cards")
 async def fuel_cards_shop(call: CallbackQuery):
-    uid = call.from_user.id
-    active = await fuel_card.active_card(uid)
+    try:
+        uid = call.from_user.id
+        active = await fuel_card.active_card(uid)
 
-    lines = ["⛽ <b>Топливные карты</b>\n"]
-    lines.append("Дает скидку на топливо на все рейсы. Действует 30 дней, потом продлевается автоматически.\n")
+        lines = ["⛽ <b>Топливные карты</b>\n"]
+        lines.append("Дает скидку на топливо на все рейсы. Действует 30 дней, потом продлевается автоматически.\n")
 
-    rows = []
-    for tier, (discount, price, days) in fuel_card.CARDS.items():
-        status = ""
-        if active and active["name"] == tier:
-            expires = (active["expires_at"] - game.now()).total_seconds() / 86400
-            status = f" ✅ (действует ещё {expires:.0f}д)"
+        rows = []
+        for tier, (discount, price, days) in fuel_card.CARDS.items():
+            status = ""
+            if active and active["name"] == tier:
+                expires = (active["expires_at"] - game.now()).total_seconds() / 86400
+                status = f" ✅ (действует ещё {expires:.0f}д)"
 
-        lines.append(f"• <b>{tier}</b> — {discount}% скидка")
-        lines.append(f"  Цена: {money(price)} на {days} дней{status}")
-        rows.append([(f"Купить/продлить", f"fc_buy:{tier}")])
+            lines.append(f"• <b>{tier}</b> — {discount}% скидка")
+            lines.append(f"  Цена: {money(price)} на {days} дней{status}")
+            rows.append([(f"Купить/продлить", f"fc_buy:{tier}")])
 
-    rows.append([("⬅️ Меню", "menu")])
-    await show(call, "\n".join(lines), kb(rows))
+        rows.append([("⬅️ Меню", "menu")])
+        await show(call, "\n".join(lines), kb(rows))
+    except Exception as e:
+        logging.exception("fuel_cards_shop error")
+        await call.answer(f"❌ Ошибка карт: {str(e)[:100]}", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("fc_buy:"))
