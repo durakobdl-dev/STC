@@ -156,19 +156,48 @@ async def menu_view(uid):
     in_transit = await db.pool.fetchval(
         "SELECT coalesce(sum(price),0) FROM trips WHERE owner=$1 AND settled=FALSE AND finish_at > now()", uid)
     lic = await game.licensed_cities(uid)
-    text = (f"🚛 <b>Симулятор Транспортной компании</b>\n\n🏢 {esc(p['name'])}\n"
-            f"⭐ Уровень {game.level(p['xp'])} · опыт {p['xp']}\n"
-            f"💰 Баланс: <b>{money(p['money'])}</b>")
-    if in_transit:
-        text += f"\n📦 В пути: {money(in_transit)}"
-    text += (f"\n\n🚚 Фур: {n} (свободны: {free})"
-             f"\n🗺 Лицензий: {len(lic)}")
+
+    # Сезон
+    season = game.season_factor()
+
+    # Активные контракты
+    active_contracts = await db.pool.fetchval("SELECT count(*) FROM contracts WHERE owner=$1 AND expires_at > now() AND trips_done < trips_total", uid) or 0
+
+    # Непроплаченные налоги
+    tax_due = await db.pool.fetchval("SELECT coalesce(sum(due),0) FROM tax_bills WHERE owner=$1 AND paid_at IS NULL", uid) or 0
+
+    text = (f"{season['label']} <b>Симулятор Транспортной компании</b>\n\n"
+            f"🏢 <b>{esc(p['name'])}</b>\n"
+            f"⭐ Уровень {game.level(p['xp'])} · {p['xp']} опыта\n"
+            f"💰 {money(p['money'])}\n")
+
+    # Статус рейсов
+    if busy > 0:
+        text += f"\n🚗 В рейсе: {busy}/{n} фур"
+    if in_transit > 0:
+        text += f"\n📦 Ожидается: {money(in_transit)}"
+
+    # Контракты и лицензии
+    lines = []
+    if active_contracts > 0:
+        lines.append(f"📋 Контрактов активно: {active_contracts}")
+    if len(lic) > 0:
+        lines.append(f"🗺️ Лицензий: {len(lic)}")
+    if lines:
+        text += "\n" + " · ".join(lines)
+
+    # Налоги
+    if tax_due > 0:
+        text += f"\n\n⚠️ <b>Налогов к оплате: {money(tax_due)}</b>"
+    else:
+        text += f"\n\n✅ Налогов не задолжено"
+
     markup = kb([[("📦 Заказы", "orders"), ("🚚 Гараж", "garage")],
                  [("🪪 Лицензии", "lic"), ("👥 Водители", "drivers")],
                  [("📋 Контракты", "contracts"), ("⛽ Топливные карты", "fuel_cards")],
-                 [("💳 Кредиты", "loans"), ("🏦 Банк", "bank")],
-                 [("🏪 Автосалон", "dealer"), ("🏆 Рейтинг", "top:money")],
-                 [("❓ Помощь", "help"), ("⚙️ Админ", "admin")]])
+                 [("🏦 Банк", "bank"), ("🏪 Автосалон", "dealer")],
+                 [("🏆 Рейтинг", "top:money"), ("❓ Помощь", "help")],
+                 [("⚙️ Админ", "admin")]])
     return text, markup
 
 
@@ -627,15 +656,26 @@ async def bank(call: CallbackQuery):
     uid = call.from_user.id
     p, est = await finance.estimate(uid)
     bills = await finance.open_bills(uid)
+    active_loan = await loans.active_loan(uid)
     n = game.now()
     end = p["tax_period_start"] + timedelta(days=finance.PERIOD_DAYS)
+
     lines = [f"🏦 <b>Банк</b>\n\n💰 Баланс: <b>{money(p['money'])}</b>"]
+
+    # Информация о кредите
+    if active_loan:
+        lines.append(f"\n💳 <b>Ваш кредит:</b>")
+        lines.append(f"Сумма: {money(active_loan['amount'])} · Осталось: {money(active_loan['remaining'])}")
+        lines.append(f"Платёж: {money(active_loan['monthly_payment'])} · Ставка: {active_loan['rate_pct']}%")
+
     if p["arrested"]:
         lines.append("🔒 <b>Счёт арестован:</b> с выручки автоматически списывается долг по налогам.")
+
     lines.append(f"\n📅 <b>Текущий налоговый период</b> (закрывается через {dur((end - n).total_seconds())})\n"
                  f"Выручка без НДС: {money(est['income'])}\nРасходы: {money(est['expenses'])}\n"
                  f"Ориентировочно к уплате: НДС {money(est['vat'])}, на прибыль {money(est['profit_tax'])}, "
                  f"НДФЛ и взносы {money(est['payroll'])}")
+
     if bills:
         total = sum(x["due"] for x in bills)
         lines.append(f"\n🧾 <b>К оплате: {money(total)}</b>")
@@ -645,9 +685,14 @@ async def bank(call: CallbackQuery):
             lines.append(f"• {money(x['due'])} · {when}")
     else:
         lines.append("\n✅ Долгов по налогам нет.")
+
     rows = []
     if bills:
         rows.append([("💳 Оплатить налоги", "taxpay")])
+    if active_loan:
+        rows.append([("💵 Погасить кредит", "loan_pay")])
+    else:
+        rows.append([("💳 Взять кредит", "loan_take")])
     rows.append([("📜 История", "history"), ("📊 Отчёт", "report")])
     rows.append([("⬅️ Меню", "menu")])
     await show(call, "\n".join(lines), kb(rows))
@@ -886,41 +931,11 @@ async def fuel_card_buy(call: CallbackQuery):
 
 
 # ---------- кредиты ----------
-@router.callback_query(F.data == "loans")
-async def loans_menu(call: CallbackQuery):
-    uid = call.from_user.id
-    active = await loans.active_loan(uid)
-
-    lines = ["💳 <b>Банковские кредиты</b>\n"]
-
-    if active:
-        lines.append("<b>Ваш кредит:</b>")
-        lines.append(f"Сумма: {money(active['amount'])}")
-        lines.append(f"Осталось: {money(active['remaining'])}")
-        lines.append(f"Ставка: {active['rate_pct']}% годовых")
-        lines.append(f"Ежемесячный платёж: {money(active['monthly_payment'])}")
-        nxt = (active["next_payment"] - game.now()).total_seconds() / 86400
-        lines.append(f"Следующий платёж: {nxt:.0f} дней")
-        lines.append("")
-        rows = [[("💵 Погасить кредит", "loan_pay")], [("⬅️ Меню", "menu")]]
-    else:
-        lines.append("Нет активных кредитов.\n")
-        lines.append("Условия кредита:")
-        lines.append(f"• Ставка: {loans.RATE_PCT}% годовых")
-        lines.append(f"• Срок: {loans.MONTHS} месяцев")
-        lines.append(f"• Максимум: {money(loans.MAX_AMOUNT)}")
-        lines.append(f"• Минимум: {money(500_000)}")
-        lines.append("")
-        rows = [[("💳 Взять кредит", "loan_take")], [("⬅️ Меню", "menu")]]
-
-    await show(call, "\n".join(lines), kb(rows))
-
-
 @router.callback_query(F.data == "loan_take")
 async def loan_take_menu(call: CallbackQuery):
     amounts = [500_000, 1_000_000, 2_000_000, 4_000_000, 8_000_000]
     rows = [[(f"{money(a)}", f"loan_go:{a}")] for a in amounts]
-    rows.append([("⬅️ Назад", "loans")])
+    rows.append([("⬅️ Назад", "bank")])
     await show(call, "💳 <b>Выберите сумму кредита:</b>", kb(rows))
 
 
@@ -933,7 +948,7 @@ async def loan_take_go(call: CallbackQuery):
         await call.answer(err, show_alert=True)
         return
     await call.answer(f"Кредит {money(amount)} выдан!", show_alert=True)
-    await loans_menu(call)
+    await bank(call)
 
 
 @router.callback_query(F.data == "loan_pay")
@@ -948,7 +963,7 @@ async def loan_pay(call: CallbackQuery):
         await call.answer(msg, show_alert=True)
         return
     await call.answer(msg, show_alert=True)
-    await loans_menu(call)
+    await bank(call)
 
 
 # ---------- помощь ----------
