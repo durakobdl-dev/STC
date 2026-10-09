@@ -28,6 +28,7 @@ import admin
 import news
 import skills
 import bases
+import fines
 from game import dur, esc, money
 
 router = Router()
@@ -1169,6 +1170,37 @@ async def base_up(call: CallbackQuery):
         return
     await call.answer("Построено!")
     await render_base(call, int(i))
+
+
+# ---------- штрафы ГИБДД ----------
+async def _fine_result(call: CallbackQuery, ok_text):
+    await show(call, "🚔 <b>Штраф ГИБДД</b>\n\n" + ok_text, kb([[("🏠 Меню", "menu")]]))
+
+
+@router.callback_query(F.data.startswith("fine_pay:"))
+async def fine_pay(call: CallbackQuery):
+    try:
+        ok, msg = await fines.pay_fine(call.from_user.id, int(call.data.split(":")[1]))
+        if not ok:
+            await call.answer(msg, show_alert=True)
+            return
+        await _fine_result(call, msg)
+    except Exception as e:
+        logging.exception("fine_pay error")
+        await call.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("fine_contest:"))
+async def fine_contest(call: CallbackQuery):
+    try:
+        ok, msg = await fines.contest_fine(call.from_user.id, int(call.data.split(":")[1]))
+        if not ok and msg.startswith("Штраф не найден"):
+            await call.answer(msg, show_alert=True)
+            return
+        await _fine_result(call, msg)
+    except Exception as e:
+        logging.exception("fine_contest error")
+        await call.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
 
 
 # ---------- помощь ----------
