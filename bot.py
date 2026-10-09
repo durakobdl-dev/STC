@@ -21,6 +21,10 @@ import dealer
 import drivers
 import finance
 import maintenance
+import fuel_card
+import loans
+import contracts
+import admin
 from game import dur, esc, money
 
 router = Router()
@@ -153,17 +157,48 @@ async def menu_view(uid):
     in_transit = await db.pool.fetchval(
         "SELECT coalesce(sum(price),0) FROM trips WHERE owner=$1 AND settled=FALSE AND finish_at > now()", uid)
     lic = await game.licensed_cities(uid)
-    text = (f"🚛 <b>Симулятор Транспортной компании</b>\n\n🏢 {esc(p['name'])}\n"
-            f"⭐ Уровень {game.level(p['xp'])} · опыт {p['xp']}\n"
-            f"💰 Баланс: <b>{money(p['money'])}</b>")
-    if in_transit:
-        text += f"\n📦 В пути: {money(in_transit)}"
-    text += (f"\n\n🚚 Фур: {n} (свободны: {free})"
-             f"\n🗺 Лицензий: {len(lic)}")
+
+    # Сезон
+    season = game.season_factor()
+
+    # Активные контракты
+    active_contracts = await db.pool.fetchval("SELECT count(*) FROM contracts WHERE owner=$1 AND expires_at > now() AND trips_done < trips_total", uid) or 0
+
+    # Непроплаченные налоги
+    tax_due = await db.pool.fetchval("SELECT coalesce(sum(due),0) FROM tax_bills WHERE owner=$1 AND paid_at IS NULL", uid) or 0
+
+    text = (f"{season['label']} <b>Симулятор Транспортной компании</b>\n\n"
+            f"🏢 <b>{esc(p['name'])}</b>\n"
+            f"⭐ Уровень {game.level(p['xp'])} · {p['xp']} опыта\n"
+            f"💰 {money(p['money'])}\n")
+
+    # Статус рейсов
+    if busy > 0:
+        text += f"\n🚗 В рейсе: {busy}/{n} фур"
+    if in_transit > 0:
+        text += f"\n📦 Ожидается: {money(in_transit)}"
+
+    # Контракты и лицензии
+    lines = []
+    if active_contracts > 0:
+        lines.append(f"📋 Контрактов активно: {active_contracts}")
+    if len(lic) > 0:
+        lines.append(f"🗺️ Лицензий: {len(lic)}")
+    if lines:
+        text += "\n" + " · ".join(lines)
+
+    # Налоги
+    if tax_due > 0:
+        text += f"\n\n⚠️ <b>Налогов к оплате: {money(tax_due)}</b>"
+    else:
+        text += f"\n\n✅ Налогов не задолжено"
+
     markup = kb([[("📦 Заказы", "orders"), ("🚚 Гараж", "garage")],
                  [("🪪 Лицензии", "lic"), ("👥 Водители", "drivers")],
+                 [("📋 Контракты", "contracts"), ("⛽ Топливные карты", "fuel_cards")],
                  [("🏦 Банк", "bank"), ("🏪 Автосалон", "dealer")],
-                 [("🏆 Рейтинг", "top:money")]])
+                 [("🏆 Рейтинг", "top:money"), ("❓ Помощь", "help")],
+                 [("⚙️ Админ", "admin")]])
     return text, markup
 
 
@@ -179,24 +214,33 @@ async def menu(call: CallbackQuery):
 # ---------- быстрый доступ к заказам ----------
 @router.callback_query(F.data == "orders")
 async def orders_quick(call: CallbackQuery):
-    uid = call.from_user.id
-    lic = await game.licensed_cities(uid)
-    trucks_by_city = {}
-    for t in await db.pool.fetch("SELECT id, brand, model, city FROM trucks WHERE owner=$1 AND NOT busy AND NOT EXISTS(SELECT 1 FROM trucks t2 WHERE t2.id=trucks.id AND EXISTS(SELECT 1 FROM maintenance m WHERE m.truck_id=trucks.id AND m.end_at > now()))", uid):
-        if t["city"] not in trucks_by_city:
-            trucks_by_city[t["city"]] = []
-        trucks_by_city[t["city"]].append(t)
-    
-    if not trucks_by_city:
-        await call.answer("Нет свободных фур", show_alert=True)
-        return
-    
-    rows = []
-    for city in sorted(trucks_by_city.keys()):
-        count = len(trucks_by_city[city])
-        rows.append([(f"{city} ({count} свобод.)", f"ordcity:{city}")])
-    rows.append([("⬅️ Меню", "menu")])
-    await show(call, "📦 <b>Выберите город:</b>", kb(rows))
+    try:
+        uid = call.from_user.id
+        lic = await game.licensed_cities(uid)
+        trucks = await db.pool.fetch("SELECT id, brand, model, city FROM trucks WHERE owner=$1 AND NOT busy", uid)
+
+        # Отфильтруем те, что на ТО
+        trucks_by_city = {}
+        for t in trucks:
+            full = await db.pool.fetchrow("SELECT * FROM trucks WHERE id=$1", t["id"])
+            if not maintenance.in_service(full):
+                if t["city"] not in trucks_by_city:
+                    trucks_by_city[t["city"]] = []
+                trucks_by_city[t["city"]].append(t)
+
+        if not trucks_by_city:
+            await call.answer("Нет свободных фур", show_alert=True)
+            return
+
+        rows = []
+        for city in sorted(trucks_by_city.keys()):
+            count = len(trucks_by_city[city])
+            rows.append([(f"{city} ({count} свобод.)", f"ordcity:{city}")])
+        rows.append([("⬅️ Меню", "menu")])
+        await show(call, "📦 <b>Выберите город:</b>", kb(rows))
+    except Exception as e:
+        logging.exception("orders_quick error")
+        await call.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("ordcity:"))
@@ -622,15 +666,26 @@ async def bank(call: CallbackQuery):
     uid = call.from_user.id
     p, est = await finance.estimate(uid)
     bills = await finance.open_bills(uid)
+    active_loan = await loans.active_loan(uid)
     n = game.now()
     end = p["tax_period_start"] + timedelta(days=finance.PERIOD_DAYS)
+
     lines = [f"🏦 <b>Банк</b>\n\n💰 Баланс: <b>{money(p['money'])}</b>"]
+
+    # Информация о кредите
+    if active_loan:
+        lines.append(f"\n💳 <b>Ваш кредит:</b>")
+        lines.append(f"Сумма: {money(active_loan['amount'])} · Осталось: {money(active_loan['remaining'])}")
+        lines.append(f"Платёж: {money(active_loan['monthly_payment'])} · Ставка: {active_loan['rate_pct']}%")
+
     if p["arrested"]:
         lines.append("🔒 <b>Счёт арестован:</b> с выручки автоматически списывается долг по налогам.")
+
     lines.append(f"\n📅 <b>Текущий налоговый период</b> (закрывается через {dur((end - n).total_seconds())})\n"
                  f"Выручка без НДС: {money(est['income'])}\nРасходы: {money(est['expenses'])}\n"
                  f"Ориентировочно к уплате: НДС {money(est['vat'])}, на прибыль {money(est['profit_tax'])}, "
                  f"НДФЛ и взносы {money(est['payroll'])}")
+
     if bills:
         total = sum(x["due"] for x in bills)
         lines.append(f"\n🧾 <b>К оплате: {money(total)}</b>")
@@ -640,58 +695,17 @@ async def bank(call: CallbackQuery):
             lines.append(f"• {money(x['due'])} · {when}")
     else:
         lines.append("\n✅ Долгов по налогам нет.")
+
     rows = []
     if bills:
         rows.append([("💳 Оплатить налоги", "taxpay")])
+    if active_loan:
+        rows.append([("💵 Погасить кредит", "loan_pay")])
+    else:
+        rows.append([("💳 Взять кредит", "loan_take")])
     rows.append([("📜 История", "history"), ("📊 Отчёт", "report")])
     rows.append([("⬅️ Меню", "menu")])
     await show(call, "\n".join(lines), kb(rows))
-
-
-@router.callback_query(F.data.startswith("fine_pay:"))
-async def fine_pay(call: CallbackQuery):
-    fine_id = int(call.data.split(":")[1])
-    fine = await db.pool.fetchrow("SELECT * FROM fines WHERE id=$1 AND owner=$2", fine_id, call.from_user.id)
-    if not fine:
-        await call.answer("Штраф не найден", show_alert=True); return
-    if fine["paid"] or fine["contested"]:
-        await call.answer("Штраф уже закрыт", show_alert=True); return
-    p = await db.pool.fetchrow("SELECT money FROM players WHERE id=$1", call.from_user.id)
-    if p["money"] < fine["amount"]:
-        await call.answer(f"Не хватает денег: нужно {money(fine['amount'])}", show_alert=True); return
-    await db.pool.execute("UPDATE players SET money = money - $2 WHERE id=$1", call.from_user.id, fine["amount"])
-    await db.pool.execute("UPDATE fines SET paid=TRUE WHERE id=$1", fine_id)
-    async with db.pool.acquire() as c:
-        await finance.expense(c, call.from_user.id, "fine", fine["amount"], False, f"Штраф ГИБДД: {fine['reason']}")
-    await call.answer(f"Штраф {money(fine['amount'])} оплачен", show_alert=True)
-    try:
-        await call.message.delete()
-    except Exception:
-        pass
-
-
-@router.callback_query(F.data.startswith("fine_contest:"))
-async def fine_contest(call: CallbackQuery):
-    fine_id = int(call.data.split(":")[1])
-    fine = await db.pool.fetchrow("SELECT * FROM fines WHERE id=$1 AND owner=$2", fine_id, call.from_user.id)
-    if not fine:
-        await call.answer("Штраф не найден", show_alert=True); return
-    if fine["paid"] or fine["contested"]:
-        await call.answer("Штраф уже закрыт", show_alert=True); return
-    await db.pool.execute("UPDATE fines SET contested=TRUE WHERE id=$1", fine_id)
-    win = random.random() * 100 < fine["contest_chance"]
-    if win:
-        text = f"⚖️ <b>Оспорено успешно!</b>\nШтраф {money(fine['amount'])} отменён. Повезло!"
-    else:
-        await db.pool.execute("UPDATE players SET money = money - $2 WHERE id=$1", call.from_user.id, fine["amount"])
-        async with db.pool.acquire() as c:
-            await finance.expense(c, call.from_user.id, "fine", fine["amount"], False, f"Штраф ГИБДД: {fine['reason']}")
-        text = f"⚖️ <b>Оспорить не удалось.</b>\nШтраф {money(fine['amount'])} списан. В следующий раз повезёт."
-    await call.answer()
-    try:
-        await call.message.edit_text(text)
-    except Exception:
-        await call.message.answer(text)
 
 
 @router.callback_query(F.data == "taxpay")
@@ -842,6 +856,528 @@ async def top(call: CallbackQuery):
         lines.append(f"{medals[i] if i < 3 else str(i + 1) + '.'} {esc(r['name'])} — {fmt(r['v'])}")
     btns = [[(v[0], f"top:{k}")] for k, v in TOPS.items()] + [[("⬅️ Меню", "menu")]]
     await show(call, "\n".join(lines), kb(btns))
+
+
+# ---------- контракты ----------
+@router.callback_query(F.data == "contracts")
+async def contracts_list(call: CallbackQuery):
+    try:
+        uid = call.from_user.id
+        active = await contracts.active_contracts(uid)
+        lic = await game.licensed_cities(uid)
+        trucks = await db.pool.fetch("SELECT id, city FROM trucks WHERE owner=$1 AND NOT busy", uid)
+
+        # Города, где есть свободные фуры
+        cities_with_trucks = set()
+        for t in trucks:
+            full = await db.pool.fetchrow("SELECT * FROM trucks WHERE id=$1", t["id"])
+            if not maintenance.in_service(full):
+                cities_with_trucks.add(t["city"])
+
+        lines = ["📋 <b>Контракты</b>\n"]
+        rows = []
+
+        if active:
+            lines.append("<b>Текущие контракты:</b>")
+            for c in active:
+                trips_left = c["trips_total"] - c["trips_done"]
+                lines.append(f"• {esc(c['client'])}: {c['cargo']}")
+                lines.append(f"  {c['from_city']} → {c['to_city']} · {trips_left}/{c['trips_total']} рейсов")
+                lines.append(f"  {money(c['price_per_trip'])} за рейс")
+            lines.append("")
+
+        if cities_with_trucks:
+            lines.append("<b>Доступные контракты:</b>")
+            for city in sorted(cities_with_trucks):
+                rows.append([(f"В {city}", f"contcity:{city}")])
+        else:
+            lines.append("Нет свободных фур для новых контрактов.")
+
+        rows.append([("⬅️ Меню", "menu")])
+        await show(call, "\n".join(lines), kb(rows))
+    except Exception as e:
+        logging.exception("contracts_list error")
+        await call.answer(f"❌ Ошибка контрактов: {str(e)[:100]}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("contcity:"))
+async def contracts_by_city(call: CallbackQuery):
+    try:
+        city = call.data.split(":", 1)[1]
+        uid = call.from_user.id
+        lic = await game.licensed_cities(uid)
+        avail = await contracts.available_contracts(uid, city, lic)
+
+        lines = [f"📋 <b>Контракты в {city}</b>\n"]
+        rows = []
+
+        if avail:
+            for i, c in enumerate(avail, 1):
+                lines.append(f"{i}. {esc(c['client'])}: {c['cargo']}")
+                lines.append(f"   {c['to_city']} · {c['tons']} т · {c['km']} км")
+                lines.append(f"   {money(c['price_per_trip'])} за рейс × 7 рейсов")
+                rows.append([(f"Взять {i}", f"contract:{city}:{c['client']}")])
+        else:
+            lines.append("Нет доступных контрактов в этом городе. Загляните позже.")
+
+        rows.append([("⬅️ Города", "contracts")])
+        await show(call, "\n".join(lines), kb(rows))
+    except Exception as e:
+        logging.exception("contracts_by_city error")
+        await call.answer(f"❌ Ошибка загрузки контрактов: {str(e)[:100]}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("contract:"))
+async def contract_take(call: CallbackQuery):
+    try:
+        uid = call.from_user.id
+        parts = call.data.split(":", 2)
+        city = parts[1]
+        client_name = parts[2]
+
+        lic = await game.licensed_cities(uid)
+        err = await contracts.take_contract(uid, city, lic, client_name)
+        if err:
+            await call.answer(err, show_alert=True)
+            return
+        await call.answer("Контракт принят!", show_alert=True)
+        await contracts_list(call)
+    except Exception as e:
+        logging.exception("contract_take error")
+        await call.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
+
+
+# ---------- топливные карты ----------
+@router.callback_query(F.data == "fuel_cards")
+async def fuel_cards_shop(call: CallbackQuery):
+    try:
+        uid = call.from_user.id
+        active = await fuel_card.active_card(uid)
+
+        lines = ["⛽ <b>Топливные карты</b>\n"]
+        lines.append("Дает скидку на топливо на все рейсы. Действует 30 дней, потом продлевается автоматически.\n")
+
+        rows = []
+        for tier, (discount, price, days) in fuel_card.CARDS.items():
+            status = ""
+            if active and active["name"] == tier:
+                expires = (active["expires_at"] - game.now()).total_seconds() / 86400
+                status = f" ✅ (действует ещё {expires:.0f}д)"
+
+            lines.append(f"• <b>{tier}</b> — {discount}% скидка")
+            lines.append(f"  Цена: {money(price)} на {days} дней{status}")
+            rows.append([(f"Купить/продлить", f"fc_buy:{tier}")])
+
+        rows.append([("⬅️ Меню", "menu")])
+        await show(call, "\n".join(lines), kb(rows))
+    except Exception as e:
+        logging.exception("fuel_cards_shop error")
+        await call.answer(f"❌ Ошибка карт: {str(e)[:100]}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("fc_buy:"))
+async def fuel_card_buy(call: CallbackQuery):
+    uid = call.from_user.id
+    tier = call.data.split(":")[1]
+    ok, msg = await fuel_card.buy_card(uid, tier)
+    if not ok:
+        await call.answer(msg, show_alert=True)
+        return
+    await call.answer(msg, show_alert=True)
+    await fuel_cards_shop(call)
+
+
+# ---------- кредиты ----------
+@router.callback_query(F.data == "loan_take")
+async def loan_take_menu(call: CallbackQuery):
+    amounts = [500_000, 1_000_000, 2_000_000, 4_000_000, 8_000_000]
+    rows = [[(f"{money(a)}", f"loan_go:{a}")] for a in amounts]
+    rows.append([("⬅️ Назад", "bank")])
+    await show(call, "💳 <b>Выберите сумму кредита:</b>", kb(rows))
+
+
+@router.callback_query(F.data.startswith("loan_go:"))
+async def loan_take_go(call: CallbackQuery):
+    uid = call.from_user.id
+    amount = int(call.data.split(":")[1])
+    err = await loans.take_loan(uid, amount)
+    if err:
+        await call.answer(err, show_alert=True)
+        return
+    await call.answer(f"Кредит {money(amount)} выдан!", show_alert=True)
+    await bank(call)
+
+
+@router.callback_query(F.data == "loan_pay")
+async def loan_pay(call: CallbackQuery):
+    uid = call.from_user.id
+    active = await loans.active_loan(uid)
+    if not active:
+        await call.answer("Кредита нет", show_alert=True)
+        return
+    ok, msg = await loans.pay_loan(uid, active["id"])
+    if not ok:
+        await call.answer(msg, show_alert=True)
+        return
+    await call.answer(msg, show_alert=True)
+    await bank(call)
+
+
+# ---------- помощь ----------
+@router.callback_query(F.data == "help")
+async def help_view(call: CallbackQuery):
+    text = """❓ <b>Справка</b>
+
+<b>Основы:</b>
+• Берите заказы из города, где стоит ваша фура
+• Для рейсов между городами нужна лицензия (действует 14 дней)
+• Перед рейсом вы получите аванс 30%, из него оплачивается топливо
+• За опоздание оплата уменьшается
+• Водитель отдыхает после 9 часов в пути
+
+<b>Бизнес:</b>
+• Нанимайте водителей, чтобы ездить на нескольких фурах одновременно
+• Покупайте топливные карты для скидок на топливо (5-10%)
+• Берите долгосрочные контракты от компаний (7 рейсов за 14 дней)
+• Возьмите кредит для развития автопарка
+
+<b>Фура:</b>
+• Каждые 50-70 тыс км нужно техническое обслуживание
+• Страховка покрывает 70% стоимости ремонта при поломках и ДТП
+• Поломку можно отремонтировать на месте или вызвать эвакуатор
+
+<b>Налоги:</b>
+• Налоги считаются каждые 3 дня
+• НДС 22%, налог на прибыль 25%
+• При задержке платежа взимается штраф
+• Арестованный счёт автоматически платит из выручки"""
+
+    await show(call, text, kb([[("⬅️ Меню", "menu")]]))
+
+
+# ---------- админ ----------
+# ---------- админ-панель ----------
+@router.callback_query(F.data == "admin")
+async def admin_menu(call: CallbackQuery):
+    """Главное меню админ-панели"""
+    try:
+        uid = call.from_user.id
+        # Проверяем админ статус
+        from config import is_admin
+        username = call.from_user.username or ""
+        if not is_admin(uid, username):
+            await call.answer("❌ Доступ запрещен", show_alert=True)
+            return
+
+        lines = ["⚙️ <b>АДМИН-ПАНЕЛЬ</b>\n"]
+
+        stats = await admin.get_stats()
+        lines.append(f"📊 <b>Статистика:</b>")
+        lines.append(f"• Игроков: {stats['players']}")
+        lines.append(f"• Фур: {stats['trucks']}")
+        lines.append(f"• Рейсов выполнено: {stats['total_trips']}")
+        lines.append(f"• Активных рейсов: {stats['active_trips']}")
+        lines.append(f"• Общий баланс: {money(stats['total_money'])}")
+        lines.append("")
+
+        rows = [[("📊 Статистика", "admin:stats"), ("📋 Логи", "admin:logs")],
+                [("👥 Все игроки", "admin:players"), ("💳 Очистить долг", "admin:debt")],
+                [("🚫 Бан/Разбан", "admin:ban"), ("🔄 Вайп", "admin:wipe")],
+                [("💰 Выдать деньги", "admin:give_money"), ("🚚 Выдать фуру", "admin:give_truck")],
+                [("⬅️ Меню", "menu")]]
+
+        await show(call, "\n".join(lines), kb(rows))
+    except Exception as e:
+        logging.exception("admin_menu error")
+        await call.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
+
+
+@router.callback_query(F.data == "admin:stats")
+async def admin_stats(call: CallbackQuery):
+    """Показать статистику"""
+    try:
+        uid = call.from_user.id
+        from config import is_admin
+        username = call.from_user.username or ""
+        if not is_admin(uid, username):
+            await call.answer("❌ Доступ запрещен", show_alert=True)
+            return
+
+        stats = await admin.get_stats()
+
+        lines = ["📊 <b>Статистика игры</b>\n"]
+        lines.append(f"Всего игроков: <b>{stats['players']}</b>")
+        lines.append(f"Всего фур: <b>{stats['trucks']}</b>")
+        lines.append(f"Всего рейсов: <b>{stats['total_trips']}</b>")
+        lines.append(f"Активных рейсов: <b>{stats['active_trips']}</b>")
+        lines.append(f"Всего км пройдено: <b>{stats['total_km']:,}</b>".replace(",", " "))
+        lines.append(f"Общий баланс всех: <b>{money(stats['total_money'])}</b>")
+        lines.append("")
+        lines.append("Средние показатели:")
+        avg_money = stats['total_money'] // max(1, stats['players'])
+        avg_trips = stats['total_trips'] // max(1, stats['players'])
+        lines.append(f"• На игрока денег: {money(avg_money)}")
+        lines.append(f"• На игрока рейсов: {avg_trips}")
+
+        rows = [[("⬅️ Меню админа", "admin")]]
+        await show(call, "\n".join(lines), kb(rows))
+    except Exception as e:
+        logging.exception("admin_stats error")
+        await call.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
+
+
+@router.callback_query(F.data == "admin:logs")
+async def admin_logs_view(call: CallbackQuery):
+    """Показать логи админ действий"""
+    try:
+        uid = call.from_user.id
+        from config import is_admin
+        username = call.from_user.username or ""
+        if not is_admin(uid, username):
+            await call.answer("❌ Доступ запрещен", show_alert=True)
+            return
+
+        logs = await admin.get_logs(15)
+
+        lines = ["📋 <b>Логи админ действий</b>\n"]
+        if logs:
+            for log in logs:
+                action = log['action']
+                detail = log['details'] or ""
+                ts = log['ts'].strftime("%Y-%m-%d %H:%M")
+                target = f"(ID {log['target_id']})" if log['target_id'] else ""
+                lines.append(f"• {action} {target} {detail}")
+                lines.append(f"  {ts}")
+        else:
+            lines.append("Нет логов")
+
+        rows = [[("⬅️ Меню админа", "admin")]]
+        await show(call, "\n".join(lines), kb(rows))
+    except Exception as e:
+        logging.exception("admin_logs_view error")
+        await call.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
+
+
+@router.callback_query(F.data == "admin:ban")
+async def admin_ban_menu(call: CallbackQuery):
+    """Меню бан/разбана"""
+    try:
+        uid = call.from_user.id
+        from config import is_admin
+        username = call.from_user.username or ""
+        if not is_admin(uid, username):
+            await call.answer("❌ Доступ запрещен", show_alert=True)
+            return
+
+        lines = ["🚫 <b>Бан/Разбан игроков</b>\n"]
+        lines.append("Введите ID или имя игрока:")
+
+        rows = [[("⬅️ Меню админа", "admin")]]
+        # Используем состояние для ввода
+        await show(call, "\n".join(lines), kb(rows))
+
+        # Надо реализовать через состояния или через inline ввод
+        # На данный момент просто показываем сообщение
+        # TODO: Добавить FSM для ввода ID
+    except Exception as e:
+        logging.exception("admin_ban_menu error")
+        await call.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
+
+
+@router.callback_query(F.data == "admin:debt")
+async def admin_clear_debt_menu(call: CallbackQuery):
+    """Меню очистки долга"""
+    try:
+        uid = call.from_user.id
+        from config import is_admin
+        username = call.from_user.username or ""
+        if not is_admin(uid, username):
+            await call.answer("❌ Доступ запрещен", show_alert=True)
+            return
+
+        lines = ["💳 <b>Очистить налоговый долг</b>\n"]
+        lines.append("Введите ID игрока:")
+
+        rows = [[("⬅️ Меню админа", "admin")]]
+        await show(call, "\n".join(lines), kb(rows))
+    except Exception as e:
+        logging.exception("admin_clear_debt_menu error")
+        await call.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
+
+
+@router.callback_query(F.data == "admin:give_money")
+async def admin_give_money_menu(call: CallbackQuery):
+    """Меню выдачи денег"""
+    try:
+        uid = call.from_user.id
+        from config import is_admin
+        username = call.from_user.username or ""
+        if not is_admin(uid, username):
+            await call.answer("❌ Доступ запрещен", show_alert=True)
+            return
+
+        lines = ["💰 <b>Выдать деньги</b>\n"]
+        lines.append("Введите ID игрока и сумму (через пробел):")
+        lines.append("Например: 123456789 1000000")
+
+        rows = [[("⬅️ Меню админа", "admin")]]
+        await show(call, "\n".join(lines), kb(rows))
+    except Exception as e:
+        logging.exception("admin_give_money_menu error")
+        await call.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
+
+
+@router.callback_query(F.data == "admin:give_truck")
+async def admin_give_truck_menu(call: CallbackQuery):
+    """Меню выдачи фуры"""
+    try:
+        uid = call.from_user.id
+        from config import is_admin
+        username = call.from_user.username or ""
+        if not is_admin(uid, username):
+            await call.answer("❌ Доступ запрещен", show_alert=True)
+            return
+
+        lines = ["🚚 <b>Выдать фуру</b>\n"]
+        lines.append("Доступные модели:")
+        for i, b in enumerate(BRANDS, 1):
+            lines.append(f"{i}. {b[0]} {b[1]}")
+        lines.append("")
+        lines.append("Введите ID или имя игрока и номер модели (через пробел):")
+        lines.append("Например: 123456789 1 или username 1")
+
+        rows = [[("⬅️ Меню админа", "admin")]]
+        await show(call, "\n".join(lines), kb(rows))
+    except Exception as e:
+        logging.exception("admin_give_truck_menu error")
+        await call.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
+
+
+@router.callback_query(F.data == "admin:players")
+async def admin_players_list(call: CallbackQuery):
+    """Показать список всех игроков"""
+    try:
+        uid = call.from_user.id
+        from config import is_admin
+        username = call.from_user.username or ""
+        if not is_admin(uid, username):
+            await call.answer("❌ Доступ запрещен", show_alert=True)
+            return
+
+        players = await admin.get_all_players(100)
+
+        lines = ["👥 <b>Все игроки (последние 100)</b>\n"]
+        if players:
+            for p in players:
+                created = p['created_at'].strftime("%Y-%m-%d %H:%M")
+                lines.append(f"• {esc(p['name'])} (ID: {p['id']})")
+                lines.append(f"  Уровень: {game.level(p['xp'])}, Рейсов: {p['trips_done']}, км: {p['total_km']:,}".replace(",", " "))
+                lines.append(f"  Деньги: {money(p['money'])}, Создан: {created}")
+        else:
+            lines.append("Нет игроков")
+
+        rows = [[("⬅️ Меню админа", "admin")]]
+        await show(call, "\n".join(lines), kb(rows))
+    except Exception as e:
+        logging.exception("admin_players_list error")
+        await call.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
+
+
+@router.callback_query(F.data == "admin:wipe")
+async def admin_wipe_confirm(call: CallbackQuery):
+    """Подтверждение вайпа"""
+    try:
+        uid = call.from_user.id
+        from config import is_admin
+        username = call.from_user.username or ""
+        if not is_admin(uid, username):
+            await call.answer("❌ Доступ запрещен", show_alert=True)
+            return
+
+        lines = ["🔄 <b>ПОЛНЫЙ ВАЙ ИГРЫ</b>\n"]
+        lines.append("⚠️ ЭТО УДАЛИТ ВСЕ ДАННЫЕ ИГРЫ")
+        lines.append("")
+        lines.append("Чтобы подтвердить, введите код:")
+        lines.append("<code>WIPE_ALL_CONFIRM</code>")
+
+        rows = [[("⬅️ Меню админа", "admin")]]
+        await show(call, "\n".join(lines), kb(rows))
+    except Exception as e:
+        logging.exception("admin_wipe_confirm error")
+        await call.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
+
+
+@router.message()
+async def admin_message_handler(m: Message):
+    """Обработчик сообщений для админ операций"""
+    try:
+        uid = m.from_user.id
+        from config import is_admin
+        username = m.from_user.username or ""
+        if not is_admin(uid, username):
+            return
+
+        text = m.text.strip()
+        if not text:
+            return
+
+        # Проверка команды вайпа
+        if text == "WIPE_ALL_CONFIRM":
+            result = await admin.wipe_all(uid, "WIPE_ALL_CONFIRM")
+            await m.answer(result)
+            return
+
+        # Обработка команд админа
+        parts = text.split()
+
+        if len(parts) >= 2:
+            # Попытаемся найти игрока по ID или имени
+            player_query = parts[0]
+            player = None
+            player_id = None
+
+            # Сначала пробуем как ID
+            try:
+                player_id = int(player_query)
+                player = await db.pool.fetchrow("SELECT * FROM players WHERE id=$1", player_id)
+            except ValueError:
+                # Не число, ищем по имени
+                players = await admin.find_player_by_name(player_query)
+                if players:
+                    player = players[0]
+                    player_id = player["id"]
+
+            if not player:
+                await m.answer(f"❌ Игрок не найден: {player_query}")
+                return
+
+            if len(parts) == 2 and parts[1].isdigit():
+                # Выдать деньги
+                amount = int(parts[1])
+                if amount > 10_000_000:
+                    await m.answer("❌ Слишком много денег (макс 10M)")
+                    return
+
+                err = await admin.give_money(uid, player_id, amount)
+                if err:
+                    await m.answer(f"❌ {err}")
+                else:
+                    await m.answer(f"✅ Выдано {money(amount)} игроку {esc(player['name'])} (ID {player_id})")
+
+            elif len(parts) == 3 and parts[1].isdigit():
+                # Выдать фуру
+                truck_idx = int(parts[1]) - 1
+                if 0 <= truck_idx < len(BRANDS):
+                    brand, model = BRANDS[truck_idx][0], BRANDS[truck_idx][1]
+                    err = await admin.give_truck(uid, player_id, brand, model)
+                    if err:
+                        await m.answer(f"❌ {err}")
+                    else:
+                        await m.answer(f"✅ Выдана фура {brand} {model} игроку {esc(player['name'])} (ID {player_id})")
+                else:
+                    await m.answer(f"❌ Неверный номер модели (1-{len(BRANDS)})")
+    except Exception as e:
+        logging.exception("admin_message_handler error")
 
 
 # ---------- запуск ----------
