@@ -712,7 +712,18 @@ async def bank(call: CallbackQuery):
     else:
         lines.append("\n✅ Долгов по налогам нет.")
 
+    pending_fines = await fines.pending(uid)
+    if pending_fines:
+        lines.append(f"\n🚔 <b>Штрафы ГИБДД: {len(pending_fines)}</b>")
+        for fn in pending_fines[:5]:
+            lines.append(f"• {esc(fn['reason'])}: <b>{money(fn['amount'])}</b> (шанс оспорить {fn['contest_chance']}%)")
+        if len(pending_fines) > 5:
+            lines.append(f"…и ещё {len(pending_fines) - 5}")
+
     rows = []
+    for fn in pending_fines[:5]:
+        rows.append([(f"💳 Оплатить {money(fn['amount'])}", f"fine_pay:{fn['id']}"),
+                     (f"⚖️ Оспорить {fn['contest_chance']}%", f"fine_contest:{fn['id']}")])
     if bills:
         rows.append([("💳 Оплатить налоги", "taxpay")])
     if active_loan:
@@ -1172,19 +1183,14 @@ async def base_up(call: CallbackQuery):
     await render_base(call, int(i))
 
 
-# ---------- штрафы ГИБДД ----------
-async def _fine_result(call: CallbackQuery, ok_text):
-    await show(call, "🚔 <b>Штраф ГИБДД</b>\n\n" + ok_text, kb([[("🏠 Меню", "menu")]]))
-
-
+# ---------- штрафы ГИБДД (кнопки живут в банке) ----------
 @router.callback_query(F.data.startswith("fine_pay:"))
 async def fine_pay(call: CallbackQuery):
     try:
         ok, msg = await fines.pay_fine(call.from_user.id, int(call.data.split(":")[1]))
-        if not ok:
-            await call.answer(msg, show_alert=True)
-            return
-        await _fine_result(call, msg)
+        await call.answer(msg, show_alert=True)
+        if ok or msg.startswith("Штраф не найден"):
+            await bank(call)
     except Exception as e:
         logging.exception("fine_pay error")
         await call.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
@@ -1194,10 +1200,8 @@ async def fine_pay(call: CallbackQuery):
 async def fine_contest(call: CallbackQuery):
     try:
         ok, msg = await fines.contest_fine(call.from_user.id, int(call.data.split(":")[1]))
-        if not ok and msg.startswith("Штраф не найден"):
-            await call.answer(msg, show_alert=True)
-            return
-        await _fine_result(call, msg)
+        await call.answer(msg, show_alert=True)
+        await bank(call)
     except Exception as e:
         logging.exception("fine_contest error")
         await call.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)

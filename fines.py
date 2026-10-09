@@ -45,10 +45,9 @@ async def issue_fine(bot, trip):
     text = (f"🚔 <b>Штраф ГИБДД!</b>\n\n"
             f"Причина: {reason}\n"
             f"Сумма: <b>{money(amount)}</b>\n\n"
-            f"Можно оплатить сразу или попытаться оспорить (шанс {contest_chance}%).")
+            f"Оплатить или оспорить (шанс {contest_chance}%) можно в Банке.")
     markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"💳 Оплатить {money(amount)}", callback_data=f"fine_pay:{fine_id}")],
-        [InlineKeyboardButton(text=f"⚖️ Оспорить (шанс {contest_chance}%)", callback_data=f"fine_contest:{fine_id}")],
+        [InlineKeyboardButton(text="🏦 Открыть банк", callback_data="bank")],
     ])
     try:
         await bot.send_message(trip["owner"], text, reply_markup=markup)
@@ -95,3 +94,9 @@ async def contest_fine(uid, fine_id: int):
                 await finance.expense(c, uid, "fine", pay, False,
                                       f"Штраф ГИБДД (оспорить не удалось): {fine['reason']}")
                 return False, f"❌ Оспорить не удалось. Штраф оплачен: {money(pay)}."
+
+
+async def pending(uid):
+    """Неоплаченные и неоспоренные штрафы игрока."""
+    return await db.pool.fetch(
+        "SELECT * FROM fines WHERE owner=$1 AND status='pending' ORDER BY id", uid)
