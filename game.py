@@ -9,13 +9,6 @@ import db
 import drivers
 import finance
 import maintenance
-import fuel_card
-import fines
-import loans
-import contracts
-import news
-import skills
-import bases
 from util import bar, dur, esc, money, now
 from config import (ADVANCE_PCT, DEFAULT_DRIVER_RATING, REAL_KM, FAR_SPEED, REST_PCT)
 from data import (CARGO, CLIENTS, FUEL, SUBURBAN, URGENT_CLIENTS, dist, waypoints)
@@ -25,30 +18,12 @@ def level(xp):
     return 1 + int(math.sqrt(xp / 60))
 
 
-def season_factor():
-    """Сезонный коэффициент: зима — медленнее и дороже, лето — больше заказов."""
-    month = now().month
-    if month in (12, 1, 2):    # зима
-        return {"speed": 0.85, "orders": 0.8, "fuel": 1.15, "label": "❄️ Зима"}
-    elif month in (6, 7, 8):   # лето
-        return {"speed": 1.0,  "orders": 1.3, "fuel": 1.0,  "label": "☀️ Лето"}
-    elif month in (3, 4, 5):   # весна
-        return {"speed": 0.92, "orders": 1.0, "fuel": 1.05, "label": "🌸 Весна"}
-    else:                       # осень
-        return {"speed": 0.95, "orders": 0.9, "fuel": 1.08, "label": "🍂 Осень"}
-
-
 # ---------- расчёты ----------
 def travel_seconds(km, speed):
-    """Время в пути. Близко как в жизни, дальше сжато. Зимой медленнее."""
-    sf = season_factor()["speed"]
-    eff_speed = speed * sf
     if km <= REAL_KM:
-        drive_h = km / eff_speed
+        drive_h = km / speed
     else:
-        # Первые REAL_KM с реальной скоростью, остаток со сжатой скоростью FAR_SPEED
-        drive_h = REAL_KM / eff_speed + (km - REAL_KM) / FAR_SPEED
-        # Отдых водителя в дальних рейсах (после 3 часов в пути)
+        drive_h = REAL_KM / speed + (km - REAL_KM) / FAR_SPEED
         extra_h = max(0, drive_h - 3)
         drive_h += extra_h * REST_PCT / 100
     return int(drive_h * 3600)
@@ -58,18 +33,10 @@ def load_seconds(tons):
     return (20 + 2 * tons) * 60
 
 
-def fuel_cost(km, cons, a, b, discount_pct=0):
+def fuel_cost(km, cons, a, b):
     liters = km * cons / 100
     price = (FUEL[a] + FUEL[b]) / 2 * (1.08 if a != b else 1.0)
-    return int(liters * price * (100 - discount_pct) / 100)
-
-
-async def fuel_for(p, t, km, a, b):
-    """Итоговая стоимость топлива: топливная карта, навык «Эко-вождение», тюнинг фуры, своя АЗС."""
-    disc = await fuel_card.discount_pct(p["id"])
-    f = fuel_cost(km, t["consumption"], a, b, disc)
-    f *= skills.fuel_factor(p) * skills.truck_fuel_factor(t) * await bases.azs_factor(p["id"], a)
-    return int(f)
+    return int(liters * price)
 
 
 # ---------- заказы ----------
@@ -95,7 +62,7 @@ def make_order(owner, city, licensed):
     else:
         short_bonus = 1.0
     min_price = 30_000 if km < 150 else (25_000 if km < 300 else 20_000)
-    max_price = 70_000 if km < 150 else (90_000 if km < 300 else 350_000)  # макс 350k для дальних
+    max_price = 70_000 if km < 150 else (90_000 if km < 300 else None)
     price = max(min_price, int(tons * km * CARGO[cargo] * short_bonus * random.uniform(0.9, 1.1) / 100) * 100)
     if max_price:
         price = min(price, max_price)
@@ -108,38 +75,14 @@ def make_order(owner, city, licensed):
     return (owner, city, to, label, cargo, tons, km, price, client, urgent, limit, expires)
 
 
-_INSERT_ORDER = """INSERT INTO orders (owner, from_city, to_city, to_label, cargo, tons, km, price,
-               client, urgent, limit_s, expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)"""
-VIP_PREFIX = "VIP: "
-
-
-def apply_news(order, events):
-    """Подгоняет цену заказа под активные новости (индексы: 2=to_city, 4=cargo, 7=price)."""
-    o = list(order)
-    m = news.price_mult(events, o[1], o[2], o[4])
-    o[7] = max(10_000, int(o[7] * m / 100) * 100)
-    return tuple(o)
-
-
 async def ensure_orders(owner, city, licensed, target=7):
     await db.pool.execute("DELETE FROM orders WHERE owner=$1 AND expires_at<=now()", owner)
     have = await db.pool.fetchval("SELECT count(*) FROM orders WHERE owner=$1 AND from_city=$2", owner, city)
-    events = await news.active()
     for _ in range(max(0, target - have)):
-        await db.pool.execute(_INSERT_ORDER, *apply_news(make_order(owner, city, licensed), events))
-    # Диспетчер на базе открывает скрытые VIP-заказы
-    if await bases.has_dispatcher(owner, city):
-        vip = await db.pool.fetchval(
-            "SELECT count(*) FROM orders WHERE owner=$1 AND from_city=$2 AND client LIKE $3",
-            owner, city, VIP_PREFIX + "%")
-        for _ in range(max(0, bases.VIP_ORDERS - vip)):
-            o = list(apply_news(make_order(owner, city, licensed), events))
-            o[7] = int(o[7] * bases.VIP_BONUS / 100) * 100      # price
-            o[8] = VIP_PREFIX + o[8]                            # client
-            o[9] = True                                         # urgent -> 🔥
-            o[10] = int(o[10] * 1.1)                            # чуть больше времени
-            o[11] = now() + timedelta(hours=random.randint(3, 6))
-            await db.pool.execute(_INSERT_ORDER, *o)
+        await db.pool.execute(
+            """INSERT INTO orders (owner, from_city, to_city, to_label, cargo, tons, km, price,
+               client, urgent, limit_s, expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)""",
+            *make_order(owner, city, licensed))
 
 
 async def licensed_cities(owner):
@@ -148,7 +91,7 @@ async def licensed_cities(owner):
 
 
 # ---------- рейсы ----------
-async def start_trip(uid, truck_id, order_id=None, dest=None, driver_id=None, contract_id=None):
+async def start_trip(uid, truck_id, order_id=None, dest=None, driver_id=None):
     """Возвращает текст ошибки или None."""
     async with db.pool.acquire() as c:
         async with c.transaction():
@@ -175,20 +118,7 @@ async def start_trip(uid, truck_id, order_id=None, dest=None, driver_id=None, co
                     "SELECT count(*) FROM trips WHERE owner=$1 AND settled=FALSE AND driver_id IS NULL", uid)
                 if own:
                     return "Вы уже за рулём другой фуры. Наймите водителя во вкладке «Водители»."
-            if contract_id is not None:
-                # Контракт: берём данные из contracts таблицы
-                ct = await c.fetchrow(
-                    "SELECT * FROM contracts WHERE id=$1 AND owner=$2 AND trips_done<trips_total AND expires_at>now() FOR UPDATE",
-                    contract_id, uid)
-                if not ct:
-                    return "Контракт недоступен."
-                if ct["tons"] > t["capacity"]:
-                    return f"Груз {ct['tons']} т тяжелее, чем грузоподъёмность фуры ({t['capacity']} т)."
-                to, label, cargo, tons, km = ct["to_city"], ct["to_city"], ct["cargo"], ct["tons"], ct["km"]
-                price = ct["price_per_trip"]
-                limit = 10**9
-                empty = False
-            elif order_id is not None:
+            if order_id is not None:
                 o = await c.fetchrow(
                     "SELECT * FROM orders WHERE id=$1 AND owner=$2 AND from_city=$3 AND expires_at>now()",
                     order_id, uid, t["city"])
@@ -204,25 +134,24 @@ async def start_trip(uid, truck_id, order_id=None, dest=None, driver_id=None, co
                 to, label, cargo, tons = dest, dest, "Порожний перегон", 0
                 km, price, empty = dist(t["city"], dest), 0, True
                 limit = 10**9
-            fuel = await fuel_for(p, t, km, t["city"], to)
-            advance = price * skills.advance_pct(p, ADVANCE_PCT) // 100
-            speed_k = await news.route_speed(t["city"], to)
+            fuel = fuel_cost(km, t["consumption"], t["city"], to)
+            advance = price * ADVANCE_PCT // 100
             if p["money"] + advance < fuel:
                 return (f"Не хватает денег на топливо: нужно {money(fuel)}, "
                         f"у вас {money(p['money'])} + аванс {money(advance)}.")
             start = now()
             load_end = start + timedelta(seconds=0 if empty else load_seconds(tons))
-            arrive = load_end + timedelta(seconds=travel_seconds(km, t["speed"] * speed_k))
+            arrive = load_end + timedelta(seconds=travel_seconds(km, t["speed"]))
             finish = arrive + timedelta(seconds=0 if empty else load_seconds(tons))
             deadline = start + timedelta(seconds=limit)
             ik, isev, iat = maintenance.roll_incident(t, km, rating, load_end, arrive)
             await c.execute(
                 """INSERT INTO trips (owner, truck_id, from_city, to_city, to_label, cargo, tons, km,
                    price, advance, fuel_cost, empty, started_at, load_end, arrive_at, finish_at, deadline,
-                   inc_kind, inc_sev, inc_at, driver_id, contract_id)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)""",
+                   inc_kind, inc_sev, inc_at, driver_id)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)""",
                 uid, truck_id, t["city"], to, label, cargo, tons, km, price, advance, fuel, empty,
-                start, load_end, arrive, finish, deadline, ik, isev, iat, driver_id or None, contract_id or None)
+                start, load_end, arrive, finish, deadline, ik, isev, iat, driver_id or None)
             if driver_id:
                 await c.execute("UPDATE drivers SET busy=TRUE WHERE id=$1", driver_id)
             await c.execute("UPDATE players SET money = money + $2 - $3 WHERE id=$1", uid, advance, fuel)
@@ -294,9 +223,6 @@ async def settle(bot, t):
             await c.execute("UPDATE trucks SET city=$2, mileage = mileage + $3, km_since_to = km_since_to + $3, busy=FALSE WHERE id=$1",
                             row["truck_id"], row["to_city"], row["km"])
             note = await drivers.after_trip(c, row)
-            # Завершаем рейс по контракту, если есть
-            if row["contract_id"]:
-                await c.execute("UPDATE contracts SET trips_done=trips_done+1 WHERE id=$1", row["contract_id"])
     if row["empty"]:
         text = f"🏁 Фура прибыла в {esc(row['to_city'])} (порожний перегон)."
     else:
@@ -318,6 +244,37 @@ async def settle(bot, t):
         await bot.send_message(row["owner"], text, reply_markup=kb)
     except Exception:
         logging.exception("notify failed")
+    await roll_fine(bot, row)
+
+
+FINE_REASONS = [
+    ("превышение скорости", 5_000, 40),
+    ("превышение скорости", 10_000, 35),
+    ("нарушение режима труда и отдыха", 7_000, 30),
+    ("перегруз (превышение нормы веса)", 15_000, 25),
+    ("неисправность тормозной системы", 8_000, 35),
+    ("нарушение правил перевозки груза", 12_000, 30),
+]
+
+
+async def roll_fine(bot, trip):
+    """Шанс штрафа ГИБДД ~12% за рейс. Вызывается при завершении рейса."""
+    if trip["empty"] or random.random() > 0.12:
+        return
+    reason, amount, contest_chance = random.choice(FINE_REASONS)
+    fine_id = await db.pool.fetchval(
+        "INSERT INTO fines (owner, trip_id, reason, amount, contest_chance) VALUES ($1,$2,$3,$4,$5) RETURNING id",
+        trip["owner"], trip["id"], reason, amount, contest_chance)
+    text = (f"🚔 <b>Штраф ГИБДД!</b>\n\nПричина: {reason}\nСумма: <b>{money(amount)}</b>\n\n"
+            f"Можно оплатить сразу или попытаться оспорить (шанс {contest_chance}%).")
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"💳 Оплатить {money(amount)}", callback_data=f"fine_pay:{fine_id}")],
+        [InlineKeyboardButton(text=f"⚖️ Оспорить (шанс {contest_chance}%)", callback_data=f"fine_contest:{fine_id}")]])
+    try:
+        await bot.send_message(trip["owner"], text, reply_markup=kb)
+    except Exception:
+        logging.exception("fine notify failed")
 
 
 async def watcher(bot):
@@ -326,17 +283,9 @@ async def watcher(bot):
             rows = await db.pool.fetch("SELECT * FROM trips WHERE settled=FALSE AND finish_at<=now()")
             for t in rows:
                 await settle(bot, t)
-            # Штрафы ГИБДД — выдаются во время рейса (после погрузки, до финиша)
-            fine_rows = await db.pool.fetch(
-                """SELECT * FROM trips WHERE settled=FALSE AND load_end<=now() AND finish_at>now()
-                   AND id NOT IN (SELECT DISTINCT trip_id FROM fines)""")
-            for t in fine_rows:
-                await fines.issue_fine(bot, t)
             await maintenance.process(bot)
             await drivers.process_daily(bot)
             await finance.process(bot)
-            await loans.process_payments(bot)
-            await news.process()
         except Exception:
             logging.exception("watcher error")
         await asyncio.sleep(15)
