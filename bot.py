@@ -15,7 +15,7 @@ from aiogram.types import (CallbackQuery, FSInputFile, InlineKeyboardButton, Inl
 
 import db
 import game
-from config import BOT_TOKEN, DATABASE_URL, LICENSE_DAYS, PORT, START_MONEY
+from config import ADVANCE_PCT, BOT_TOKEN, DATABASE_URL, LICENSE_DAYS, PORT, START_MONEY
 from data import BRANDS, CITIES, LICENSE_PRICE, START_TRUCKS, TO_INTERVAL, TRUCK_PHOTOS, dist
 import dealer
 import drivers
@@ -25,6 +25,9 @@ import fuel_card
 import loans
 import contracts
 import admin
+import news
+import skills
+import bases
 from game import dur, esc, money
 
 router = Router()
@@ -187,6 +190,11 @@ async def menu_view(uid):
     if lines:
         text += "\n" + " · ".join(lines)
 
+    # Очки навыков
+    free_sp = skills.free_points(p, game.level(p["xp"]))
+    if free_sp > 0:
+        text += f"\n🧠 Свободных очков навыков: <b>{free_sp}</b>"
+
     # Налоги
     if tax_due > 0:
         text += f"\n\n⚠️ <b>Налогов к оплате: {money(tax_due)}</b>"
@@ -197,8 +205,9 @@ async def menu_view(uid):
                  [("🪪 Лицензии", "lic"), ("👥 Водители", "drivers")],
                  [("📋 Контракты", "contracts"), ("⛽ Топливные карты", "fuel_cards")],
                  [("🏦 Банк", "bank"), ("🏪 Автосалон", "dealer")],
-                 [("🏆 Рейтинг", "top:money"), ("❓ Помощь", "help")],
-                 [("⚙️ Админ", "admin")]])
+                 [("📰 Новости", "news"), ("🧠 Навыки", "skills")],
+                 [("🏗 Базы", "bases"), ("🏆 Рейтинг", "top:money")],
+                 [("❓ Помощь", "help"), ("⚙️ Админ", "admin")]])
     return text, markup
 
 
@@ -306,6 +315,7 @@ async def render_truck(call: CallbackQuery, tid: int):
         text += "🟢 Свободна"
         rows = [[("📦 Заказы", f"orders:{tid}")], [("🚚 Перегнать порожняком", f"move:{tid}")],
                 [("🔧 ТО", f"to:{tid}"), ("🛡 Страховка", f"ins:{tid}")],
+                [("🛠 Тюнинг", f"tune:{tid}")],
                 [("💰 Продать фуру", f"sell:{tid}")],
                 [("⬅️ Гараж", "garage")]]
     await show(call, text, kb(rows), photo=photo_for(t["brand"], t["model"]))
@@ -448,9 +458,12 @@ async def to_card(call: CallbackQuery):
     if not t or t["busy"]:
         await call.answer("Фура недоступна")
         return
+    p = await get_player(call.from_user.id)
+    cost = await maintenance.service_cost(p, t)
+    cost_note = f" (базовая цена {money(TO_COST)})" if cost != TO_COST else ""
     text = (f"🔧 <b>Техобслуживание</b>\n{t['brand']} {t['model']} · {t['city']}\n\n"
             f"{maintenance.to_line(t)}\n\n"
-            f"Стоимость: {money(TO_COST)}\nВремя: {TO_HOURS} ч (фура не сможет ехать)\n"
+            f"Стоимость: {money(cost)}{cost_note}\nВремя: {TO_HOURS} ч (фура не сможет ехать)\n"
             f"После ТО риск поломок снижается до следующего интервала.")
     await show(call, text, kb([[("✅ Провести ТО", f"to_go:{tid}")], [("⬅️ Назад", f"truck:{tid}")]]))
 
@@ -500,6 +513,7 @@ async def orders_list(call: CallbackQuery):
         await call.answer("Фура недоступна")
         return
     lic = await game.licensed_cities(uid)
+    p = await get_player(uid)
     await game.ensure_orders(uid, t["city"], lic)
     rows = await db.pool.fetch(
         "SELECT * FROM orders WHERE owner=$1 AND from_city=$2 AND expires_at>now() ORDER BY km", uid, t["city"])
@@ -508,7 +522,7 @@ async def orders_list(call: CallbackQuery):
     for i, o in enumerate(rows, 1):
         flag = "🔥" if o["urgent"] else ("🏘" if o["to_city"] == o["from_city"] else "🛣")
         big = " ❌" if o["tons"] > t["capacity"] else ""
-        fuel = game.fuel_cost(o["km"], t["consumption"], o["from_city"], o["to_city"])
+        fuel = await game.fuel_for(p, t, o["km"], o["from_city"], o["to_city"])
         profit = o["price"] - fuel
         lines.append(f"{i}. {flag} <b>{esc(o['to_label'])}</b> ({o['km']} км, {o['tons']} т)")
         lines.append(f"   {o['cargo']} → <b>{money(o['price'])}</b> (прибыль ~{money(profit)}){big}")
@@ -530,8 +544,9 @@ async def order_view(call: CallbackQuery):
     if not t or not o:
         await call.answer("Заказ уже недоступен")
         return
-    fuel = game.fuel_cost(o["km"], t["consumption"], o["from_city"], o["to_city"])
-    trav = game.travel_seconds(o["km"], t["speed"])
+    p = await get_player(uid)
+    fuel = await game.fuel_for(p, t, o["km"], o["from_city"], o["to_city"])
+    trav = game.travel_seconds(o["km"], t["speed"] * await news.route_speed(o["from_city"], o["to_city"]))
     ld = game.load_seconds(o["tons"])
     base_time = 2 * ld + trav
     ratio = min(100, 100 * base_time // max(1, o["limit_s"]))
@@ -539,7 +554,7 @@ async def order_view(call: CallbackQuery):
     extra = " (срочный — больше денег, но и больше штрафов)" if o["urgent"] else ""
     text = (f"{'🔥 СРОЧНЫЙ · ' if o['urgent'] else ''}<b>{o['from_city']} → {esc(o['to_label'])}</b>\n"
             f"Заказчик: {esc(o['client'])}\nГруз: {o['cargo']}, {o['tons']} т · {o['km']} км\n\n"
-            f"💰 Доход: <b>{money(o['price'])}</b> (аванс 30%)\n"
+            f"💰 Доход: <b>{money(o['price'])}</b> (аванс {skills.advance_pct(p, ADVANCE_PCT)}%)\n"
             f"⛽ Топливо: −{money(fuel)}\n"
             f"📈 Прибыль: <b>~{money(o['price'] - fuel)}</b>\n\n"
             f"⏱ Расчётное время в пути: {dur(trav)} (дорога)\n"
@@ -1023,6 +1038,139 @@ async def loan_pay(call: CallbackQuery):
     await bank(call)
 
 
+# ---------- новости ----------
+@router.callback_query(F.data == "news")
+async def news_view(call: CallbackQuery):
+    try:
+        await show(call, news.render(await news.active()),
+                   kb([[("🔄 Обновить", "news")], [("⬅️ Меню", "menu")]]))
+    except Exception as e:
+        logging.exception("news_view error")
+        await call.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
+
+
+# ---------- навыки ----------
+@router.callback_query(F.data == "skills")
+async def skills_view(call: CallbackQuery):
+    try:
+        p = await get_player(call.from_user.id)
+        if not p:
+            await call.answer("Нажмите /start")
+            return
+        lvl = game.level(p["xp"])
+        rows = [[(f"➕ {title} ({p[col]}/{cap})", f"sk_up:{key}")]
+                for key, (title, col, cap, _) in skills.BRANCHES.items() if p[col] < cap]
+        rows.append([("⬅️ Меню", "menu")])
+        await show(call, skills.render(p, lvl), kb(rows))
+    except Exception as e:
+        logging.exception("skills_view error")
+        await call.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("sk_up:"))
+async def skills_up(call: CallbackQuery):
+    err = await skills.upgrade(call.from_user.id, call.data.split(":")[1])
+    if err:
+        await call.answer(err, show_alert=True)
+        return
+    await call.answer("Навык прокачан!")
+    await skills_view(call)
+
+
+# ---------- тюнинг ----------
+async def render_tune(call: CallbackQuery, tid: int):
+    t = await db.pool.fetchrow("SELECT * FROM trucks WHERE id=$1 AND owner=$2", tid, call.from_user.id)
+    if not t or t["busy"]:
+        await call.answer("Фура недоступна", show_alert=True)
+        return
+    rows = [[(f"{title}: {money(price)}", f"tune_buy:{tid}:{key}")]
+            for key, (title, price, col, _) in skills.TUNING.items() if not t[col]]
+    rows.append([("⬅️ К фуре", f"truck:{tid}")])
+    text = f"🛠 <b>Тюнинг: {t['brand']} {t['model']}</b>\n\n" + skills.tuning_lines(t)
+    await show(call, text, kb(rows))
+
+
+@router.callback_query(F.data.startswith("tune:"))
+async def tune_view(call: CallbackQuery):
+    await render_tune(call, int(call.data.split(":")[1]))
+
+
+@router.callback_query(F.data.startswith("tune_buy:"))
+async def tune_buy(call: CallbackQuery):
+    _, tid, kind = call.data.split(":")
+    err = await skills.buy_tuning(call.from_user.id, int(tid), kind)
+    if err:
+        await call.answer(err, show_alert=True)
+        return
+    await call.answer("Улучшение установлено!")
+    await render_tune(call, int(tid))
+
+
+# ---------- базы ----------
+@router.callback_query(F.data == "bases")
+async def bases_view(call: CallbackQuery):
+    try:
+        uid = call.from_user.id
+        mine = {b["city"]: b for b in await bases.owned(uid)}
+        lines = ["🏗 <b>Собственные базы</b>\nУчасток в городе открывает свою СТО, АЗС и диспетчера: "
+                 "это дорогие долгосрочные вложения.\n"]
+        rows = []
+        for i, city in enumerate(CITIES):
+            b = mine.get(city)
+            if b:
+                tags = " ".join(x for x, on in (("🛠", b["sto"]), ("⛽", b["azs"]), ("📞", b["dispatcher"])) if on)
+                lines.append(f"✅ {city} {tags}".rstrip())
+                rows.append([(f"🏗 {city}", f"base:{i}")])
+            else:
+                lines.append(f"▫️ {city}: участок {money(bases.price_of(city))}")
+                rows.append([(f"Купить участок: {city}", f"base_buy:{i}")])
+        lines.append("\n🛠 СТО · ⛽ АЗС · 📞 диспетчер")
+        rows.append([("⬅️ Меню", "menu")])
+        await show(call, "\n".join(lines), kb(rows))
+    except Exception as e:
+        logging.exception("bases_view error")
+        await call.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
+
+
+async def render_base(call: CallbackQuery, i: int):
+    city = CITIES[i]
+    b = await bases.get(call.from_user.id, city)
+    if not b:
+        await call.answer("Базы в этом городе нет", show_alert=True)
+        return
+    rows = [[(f"{title}: {money(price)}", f"base_up:{i}:{key}")]
+            for key, (title, price, col, _) in bases.UPGRADES.items() if not b[col]]
+    rows.append([("⬅️ Базы", "bases")])
+    await show(call, bases.base_card(b), kb(rows))
+
+
+@router.callback_query(F.data.startswith("base:"))
+async def base_view(call: CallbackQuery):
+    await render_base(call, int(call.data.split(":")[1]))
+
+
+@router.callback_query(F.data.startswith("base_buy:"))
+async def base_buy(call: CallbackQuery):
+    i = int(call.data.split(":")[1])
+    err = await bases.buy_base(call.from_user.id, CITIES[i])
+    if err:
+        await call.answer(err, show_alert=True)
+        return
+    await call.answer(f"База в городе {CITIES[i]} куплена!", show_alert=True)
+    await render_base(call, i)
+
+
+@router.callback_query(F.data.startswith("base_up:"))
+async def base_up(call: CallbackQuery):
+    _, i, kind = call.data.split(":")
+    err = await bases.buy_upgrade(call.from_user.id, CITIES[int(i)], kind)
+    if err:
+        await call.answer(err, show_alert=True)
+        return
+    await call.answer("Построено!")
+    await render_base(call, int(i))
+
+
 # ---------- помощь ----------
 @router.callback_query(F.data == "help")
 async def help_view(call: CallbackQuery):
@@ -1045,6 +1193,12 @@ async def help_view(call: CallbackQuery):
 • Каждые 50-70 тыс км нужно техническое обслуживание
 • Страховка покрывает 70% стоимости ремонта при поломках и ДТП
 • Поломку можно отремонтировать на месте или вызвать эвакуатор
+
+<b>Развитие:</b>
+• 📰 Новости регионов раз в сутки меняют оплату и скорость в городах
+• 🧠 За каждый уровень дают очко навыка: эко-вождение, механик, переговорщик
+• 🛠 Тюнинг фуры: бак, обвесы, резина
+• 🏗 Свои базы: СТО, АЗС и диспетчер с VIP-заказами
 
 <b>Налоги:</b>
 • Налоги считаются каждые 3 дня

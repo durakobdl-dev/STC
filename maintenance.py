@@ -4,8 +4,10 @@ from datetime import timedelta
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+import bases
 import db
 import finance
+import skills
 from config import (INSURANCE_DAYS, INSURANCE_PCT, INSURANCE_PRICE, TO_COST, TO_HOURS,
                     TOW_DEFAULT_H, TOW_MIN_H)
 from data import TO_INTERVAL
@@ -85,7 +87,7 @@ def accident_chance(km, rating):
 def roll_incident(t, km, rating, load_end, arrive_at):
     """Решаем заранее, будет ли в рейсе происшествие и когда. -> (kind, sev, at) или (None, None, None)"""
     r = random.random()
-    pa = accident_chance(km, rating)
+    pa = accident_chance(km, rating) * skills.accident_factor(t)     # хорошая резина снижает шанс ДТП
     pb = breakdown_chance(t, km, rating)
     if r < pa:
         kind = "accident"
@@ -142,6 +144,10 @@ async def create_incident(bot, trip):
     cost = random.randint(*cost_r) // 100 * 100
     repair_s = random.randint(*rep_r)
     t = await db.pool.fetchrow("SELECT * FROM trucks WHERE id=$1", row["truck_id"])
+    owner = await db.pool.fetchrow("SELECT * FROM players WHERE id=$1", row["owner"])
+    # навык «Механик» и собственная СТО (в городе отправления или назначения) удешевляют ремонт
+    k = skills.service_factor(owner) * await bases.sto_factor(row["owner"], row["from_city"], row["to_city"])
+    cost = int(cost * k) // 100 * 100
     covered = cost * INSURANCE_PCT // 100 if insured(t) else 0
     pay = cost - covered
     delay = timedelta(seconds=TOW_DEFAULT_H * H + repair_s)
@@ -204,6 +210,11 @@ async def call_tow(uid, inc_id):
 
 
 # ---------- ТО и страховка ----------
+async def service_cost(p, t):
+    """Цена ТО с учётом навыка «Механик» и своей СТО в городе, где стоит фура."""
+    return int(TO_COST * skills.service_factor(p) * await bases.sto_factor(p["id"], t["city"]))
+
+
 async def do_service(uid, truck_id):
     async with db.pool.acquire() as c:
         async with c.transaction():
@@ -215,10 +226,11 @@ async def do_service(uid, truck_id):
                 return "Фура в рейсе."
             if in_service(t):
                 return "Фура уже на ТО."
-            if p["money"] < TO_COST:
-                return f"Не хватает денег: ТО стоит {money(TO_COST)}."
-            await c.execute("UPDATE players SET money = money - $2 WHERE id=$1", uid, TO_COST)
-            await finance.expense(c, uid, "service", TO_COST, True, f"ТО {t['brand']} {t['model']}")
+            cost = await service_cost(p, t)
+            if p["money"] < cost:
+                return f"Не хватает денег: ТО стоит {money(cost)}."
+            await c.execute("UPDATE players SET money = money - $2 WHERE id=$1", uid, cost)
+            await finance.expense(c, uid, "service", cost, True, f"ТО {t['brand']} {t['model']}")
             await c.execute("UPDATE trucks SET km_since_to=0, maint_until = now() + make_interval(hours => $2) "
                             "WHERE id=$1", truck_id, TO_HOURS)
     return None

@@ -13,6 +13,9 @@ import fuel_card
 import fines
 import loans
 import contracts
+import news
+import skills
+import bases
 from util import bar, dur, esc, money, now
 from config import (ADVANCE_PCT, DEFAULT_DRIVER_RATING, REAL_KM, FAR_SPEED, REST_PCT)
 from data import (CARGO, CLIENTS, FUEL, SUBURBAN, URGENT_CLIENTS, dist, waypoints)
@@ -61,6 +64,14 @@ def fuel_cost(km, cons, a, b, discount_pct=0):
     return int(liters * price * (100 - discount_pct) / 100)
 
 
+async def fuel_for(p, t, km, a, b):
+    """Итоговая стоимость топлива: топливная карта, навык «Эко-вождение», тюнинг фуры, своя АЗС."""
+    disc = await fuel_card.discount_pct(p["id"])
+    f = fuel_cost(km, t["consumption"], a, b, disc)
+    f *= skills.fuel_factor(p) * skills.truck_fuel_factor(t) * await bases.azs_factor(p["id"], a)
+    return int(f)
+
+
 # ---------- заказы ----------
 def make_order(owner, city, licensed):
     inter = [c for c in licensed if c != city and dist(city, c)]
@@ -97,14 +108,38 @@ def make_order(owner, city, licensed):
     return (owner, city, to, label, cargo, tons, km, price, client, urgent, limit, expires)
 
 
+_INSERT_ORDER = """INSERT INTO orders (owner, from_city, to_city, to_label, cargo, tons, km, price,
+               client, urgent, limit_s, expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)"""
+VIP_PREFIX = "VIP: "
+
+
+def apply_news(order, events):
+    """Подгоняет цену заказа под активные новости (индексы: 2=to_city, 4=cargo, 7=price)."""
+    o = list(order)
+    m = news.price_mult(events, o[1], o[2], o[4])
+    o[7] = max(10_000, int(o[7] * m / 100) * 100)
+    return tuple(o)
+
+
 async def ensure_orders(owner, city, licensed, target=7):
     await db.pool.execute("DELETE FROM orders WHERE owner=$1 AND expires_at<=now()", owner)
     have = await db.pool.fetchval("SELECT count(*) FROM orders WHERE owner=$1 AND from_city=$2", owner, city)
+    events = await news.active()
     for _ in range(max(0, target - have)):
-        await db.pool.execute(
-            """INSERT INTO orders (owner, from_city, to_city, to_label, cargo, tons, km, price,
-               client, urgent, limit_s, expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)""",
-            *make_order(owner, city, licensed))
+        await db.pool.execute(_INSERT_ORDER, *apply_news(make_order(owner, city, licensed), events))
+    # Диспетчер на базе открывает скрытые VIP-заказы
+    if await bases.has_dispatcher(owner, city):
+        vip = await db.pool.fetchval(
+            "SELECT count(*) FROM orders WHERE owner=$1 AND from_city=$2 AND client LIKE $3",
+            owner, city, VIP_PREFIX + "%")
+        for _ in range(max(0, bases.VIP_ORDERS - vip)):
+            o = list(apply_news(make_order(owner, city, licensed), events))
+            o[7] = int(o[7] * bases.VIP_BONUS / 100) * 100      # price
+            o[8] = VIP_PREFIX + o[8]                            # client
+            o[9] = True                                         # urgent -> 🔥
+            o[10] = int(o[10] * 1.1)                            # чуть больше времени
+            o[11] = now() + timedelta(hours=random.randint(3, 6))
+            await db.pool.execute(_INSERT_ORDER, *o)
 
 
 async def licensed_cities(owner):
@@ -169,15 +204,15 @@ async def start_trip(uid, truck_id, order_id=None, dest=None, driver_id=None, co
                 to, label, cargo, tons = dest, dest, "Порожний перегон", 0
                 km, price, empty = dist(t["city"], dest), 0, True
                 limit = 10**9
-            disc = await fuel_card.discount_pct(uid)
-            fuel = fuel_cost(km, t["consumption"], t["city"], to, disc)
-            advance = price * ADVANCE_PCT // 100
+            fuel = await fuel_for(p, t, km, t["city"], to)
+            advance = price * skills.advance_pct(p, ADVANCE_PCT) // 100
+            speed_k = await news.route_speed(t["city"], to)
             if p["money"] + advance < fuel:
                 return (f"Не хватает денег на топливо: нужно {money(fuel)}, "
                         f"у вас {money(p['money'])} + аванс {money(advance)}.")
             start = now()
             load_end = start + timedelta(seconds=0 if empty else load_seconds(tons))
-            arrive = load_end + timedelta(seconds=travel_seconds(km, t["speed"]))
+            arrive = load_end + timedelta(seconds=travel_seconds(km, t["speed"] * speed_k))
             finish = arrive + timedelta(seconds=0 if empty else load_seconds(tons))
             deadline = start + timedelta(seconds=limit)
             ik, isev, iat = maintenance.roll_incident(t, km, rating, load_end, arrive)
@@ -301,6 +336,7 @@ async def watcher(bot):
             await drivers.process_daily(bot)
             await finance.process(bot)
             await loans.process_payments(bot)
+            await news.process()
         except Exception:
             logging.exception("watcher error")
         await asyncio.sleep(15)
