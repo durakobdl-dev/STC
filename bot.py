@@ -178,7 +178,7 @@ async def menu_view(uid):
     lvl = game.level(p["xp"])
     to_next = progression.xp_for(lvl + 1) - p["xp"]
     text = (f"{season['label']} <b>Симулятор Транспортной компании</b>\n"
-            f"🟦🟩🟨🟪🟥\n\n"
+            f"\n"
             f"🏢 <b>{esc(p['name'])}</b>\n"
             f"⭐ Уровень {lvl} · до следующего ещё {to_next} опыта\n"
             f"🚛 Фур: {n}/{progression.max_trucks(lvl)} · 💰 {money(p['money'])}\n")
@@ -211,13 +211,27 @@ async def menu_view(uid):
     else:
         text += f"\n\n✅ Налогов не задолжено"
 
-    # 🟦 работа · 🟩 люди и топливо · 🟨 деньги · 🟪 развитие · 🟥 прочее
-    markup = kb([[("🟦 📦 Заказы", "orders"), ("🟦 🚚 Гараж", "garage"), ("🟦 📋 Контракты", "contracts")],
-                 [("🟩 👥 Водители", "drivers"), ("🟩 🪪 Лицензии и визы", "lic"), ("🟩 ⛽ Топливо", "fuel_cards")],
-                 [("🟨 🏦 Банк", "bank"), ("🟨 🏪 Автосалон", "dealer")],
-                 [("🟪 📰 Новости", "news"), ("🟪 🧠 Навыки", "skills"), ("🟪 🏗 Базы", "bases")],
-                 [("🟥 🏆 Рейтинг", "top:money"), ("🟥 ❓ Помощь", "help"), ("🟥 ⚙️ Админ", "admin")]])
+    markup = kb([[("📦 Работа", "sec:work"), ("🏢 Компания", "sec:company")],
+                 [("💰 Финансы", "sec:money"), ("📈 Развитие", "sec:growth")],
+                 [("❓ Помощь", "help"), ("⚙️ Админ", "admin")]])
     return text, markup
+
+
+SECTIONS = {
+    "work": ("📦 Работа", [("📦 Заказы", "orders"), ("🚚 Гараж", "garage"), ("📋 Контракты", "contracts")]),
+    "company": ("🏢 Компания", [("👥 Водители", "drivers"), ("🪪 Лицензии и визы", "lic"),
+                                ("⛽ Топливо", "fuel_cards"), ("🏪 Автосалон", "dealer"), ("🏗 Базы", "bases")]),
+    "money": ("💰 Финансы", [("🏦 Банк", "bank"), ("🏆 Рейтинг", "top:money")]),
+    "growth": ("📈 Развитие", [("🧠 Навыки", "skills"), ("📰 Новости", "news")]),
+}
+
+
+@router.callback_query(F.data.startswith("sec:"))
+async def section_view(call: CallbackQuery):
+    title, items = SECTIONS[call.data.split(":")[1]]
+    rows = [[(t, d)] for t, d in items]
+    rows.append([("⬅️ Меню", "menu")])
+    await show(call, f"<b>{title}</b>\nВыберите раздел:", kb(rows))
 
 
 @router.callback_query(F.data == "menu")
