@@ -29,6 +29,9 @@ import news
 import skills
 import bases
 import fines
+import visas
+import progression
+from data import ALL_CITIES, FOREIGN, HOME, country_of
 from game import dur, esc, money
 
 router = Router()
@@ -160,7 +163,8 @@ async def menu_view(uid):
     free = n - busy
     in_transit = await db.pool.fetchval(
         "SELECT coalesce(sum(price),0) FROM trips WHERE owner=$1 AND settled=FALSE AND finish_at > now()", uid)
-    lic = await game.licensed_cities(uid)
+    lic = [c for c in await game.licensed_cities(uid) if c in CITIES]
+    visa_n = len(await visas.active_countries(uid))
 
     # Сезон
     season = game.season_factor()
@@ -171,10 +175,13 @@ async def menu_view(uid):
     # Непроплаченные налоги
     tax_due = await db.pool.fetchval("SELECT coalesce(sum(due),0) FROM tax_bills WHERE owner=$1 AND paid_at IS NULL", uid) or 0
 
-    text = (f"{season['label']} <b>Симулятор Транспортной компании</b>\n\n"
+    lvl = game.level(p["xp"])
+    to_next = progression.xp_for(lvl + 1) - p["xp"]
+    text = (f"{season['label']} <b>Симулятор Транспортной компании</b>\n"
+            f"🟦🟩🟨🟪🟥\n\n"
             f"🏢 <b>{esc(p['name'])}</b>\n"
-            f"⭐ Уровень {game.level(p['xp'])} · {p['xp']} опыта\n"
-            f"💰 {money(p['money'])}\n")
+            f"⭐ Уровень {lvl} · до следующего ещё {to_next} опыта\n"
+            f"🚛 Фур: {n}/{progression.max_trucks(lvl)} · 💰 {money(p['money'])}\n")
 
     # Статус рейсов
     if busy > 0:
@@ -188,6 +195,8 @@ async def menu_view(uid):
         lines.append(f"📋 Контрактов активно: {active_contracts}")
     if len(lic) > 0:
         lines.append(f"🗺️ Лицензий: {len(lic)}")
+    if visa_n > 0:
+        lines.append(f"🛂 Виз: {visa_n}")
     if lines:
         text += "\n" + " · ".join(lines)
 
@@ -202,13 +211,12 @@ async def menu_view(uid):
     else:
         text += f"\n\n✅ Налогов не задолжено"
 
-    markup = kb([[("📦 Заказы", "orders"), ("🚚 Гараж", "garage")],
-                 [("🪪 Лицензии", "lic"), ("👥 Водители", "drivers")],
-                 [("📋 Контракты", "contracts"), ("⛽ Топливные карты", "fuel_cards")],
-                 [("🏦 Банк", "bank"), ("🏪 Автосалон", "dealer")],
-                 [("📰 Новости", "news"), ("🧠 Навыки", "skills")],
-                 [("🏗 Базы", "bases"), ("🏆 Рейтинг", "top:money")],
-                 [("❓ Помощь", "help"), ("⚙️ Админ", "admin")]])
+    # 🟦 работа · 🟩 люди и топливо · 🟨 деньги · 🟪 развитие · 🟥 прочее
+    markup = kb([[("🟦 📦 Заказы", "orders"), ("🟦 🚚 Гараж", "garage"), ("🟦 📋 Контракты", "contracts")],
+                 [("🟩 👥 Водители", "drivers"), ("🟩 🪪 Лицензии и визы", "lic"), ("🟩 ⛽ Топливо", "fuel_cards")],
+                 [("🟨 🏦 Банк", "bank"), ("🟨 🏪 Автосалон", "dealer")],
+                 [("🟪 📰 Новости", "news"), ("🟪 🧠 Навыки", "skills"), ("🟪 🏗 Базы", "bases")],
+                 [("🟥 🏆 Рейтинг", "top:money"), ("🟥 ❓ Помощь", "help"), ("🟥 ⚙️ Админ", "admin")]])
     return text, markup
 
 
@@ -428,7 +436,7 @@ async def candidate_card(call: CallbackQuery):
             f"Стаж: {c['stazh']} рейсов\n💵 Просит: {c['salary']} ₽/км\n"
             f"💰 Стоимость найма: {money(cost)}\n\n"
             f"Водитель приедет в город, где стоит ваша фура. Выберите город:")
-    rows = [[(f"Нанять в городе {city}", f"hire:{cid}:{CITIES.index(city)}")] for city in cities]
+    rows = [[(f"Нанять в городе {city}", f"hire:{cid}:{ALL_CITIES.index(city)}")] for city in cities]
     rows.append([("⬅️ К списку", "cands")])
     await show(call, text, kb(rows))
 
@@ -436,7 +444,7 @@ async def candidate_card(call: CallbackQuery):
 @router.callback_query(F.data.startswith("hire:"))
 async def hire_driver(call: CallbackQuery):
     _, cid, ci = call.data.split(":")
-    err = await drivers.hire(call.from_user.id, int(cid), CITIES[int(ci)])
+    err = await drivers.hire(call.from_user.id, int(cid), ALL_CITIES[int(ci)])
     if err:
         await call.answer(err, show_alert=True)
         return
@@ -514,10 +522,16 @@ async def orders_list(call: CallbackQuery):
         await call.answer("Фура недоступна")
         return
     lic = await game.licensed_cities(uid)
+    if game.visa_blocked(t["city"], lic):
+        await call.answer(f"Нужна виза: {country_of(t['city'])}. Оформите её во вкладке «Лицензии».", show_alert=True)
+        return
     p = await get_player(uid)
     await game.ensure_orders(uid, t["city"], lic)
     rows = await db.pool.fetch(
         "SELECT * FROM orders WHERE owner=$1 AND from_city=$2 AND expires_at>now() ORDER BY km", uid, t["city"])
+    ctr = await db.pool.fetch(
+        "SELECT * FROM contracts WHERE owner=$1 AND from_city=$2 AND trips_done<trips_total AND expires_at>now() ORDER BY id",
+        uid, t["city"])
     lines = [f"📦 <b>Заказы из города {t['city']}</b>", f"Ваша фура: {t['brand']} {t['model']} · {t['capacity']} т", ""]
     btns = []
     for i, o in enumerate(rows, 1):
@@ -528,7 +542,14 @@ async def orders_list(call: CallbackQuery):
         lines.append(f"{i}. {flag} <b>{esc(o['to_label'])}</b> ({o['km']} км, {o['tons']} т)")
         lines.append(f"   {o['cargo']} → <b>{money(o['price'])}</b> (прибыль ~{money(profit)}){big}")
         btns.append((str(i), f"order:{tid}:{o['id']}"))
-    lines.append("\n🔥 срочный · 🏘 пригород · 🛣 между городами · ❌ слишком тяжёлый")
+    for c in ctr:
+        k = len(btns) + 1
+        lines.append(f"📋 <b>КОНТРАКТ · {esc(c['client'])}</b> → {esc(c['to_label'] or c['to_city'])} "
+                     f"({c['km']} км, {c['tons']} т)")
+        lines.append(f"   {c['cargo']} → <b>{money(c['price_per_trip'])}</b> за рейс · рейс "
+                     f"{c['trips_done'] + 1}/{c['trips_total']}" + (" ❌" if c["tons"] > t["capacity"] else ""))
+        btns.append((f"📋{k}", f"ctr:{tid}:{c['id']}"))
+    lines.append("\n🔥 срочный · 🏘 пригород · 🛣 между городами · 📋 контракт · ❌ слишком тяжёлый")
     if len([c for c in lic if c != t["city"]]) == 0:
         lines.append("💡 Купите лицензию на город, чтобы появились межгородские заказы.")
     markup = [btns[i:i + 4] for i in range(0, len(btns), 4)]
@@ -563,6 +584,39 @@ async def order_view(call: CallbackQuery):
             f"   = {dur(base_time)} всего\n\n"
             f"⏳ Лимит: {dur(o['limit_s'])} ({risk}){extra}")
     await show(call, text, kb([[("✅ Взять заказ", f"take:{tid}:{oid}")], [("⬅️ К заказам", f"orders:{tid}")]]))
+
+
+@router.callback_query(F.data.startswith("ctr:"))
+async def contract_trip_view(call: CallbackQuery):
+    _, tid, cid = call.data.split(":")
+    uid = call.from_user.id
+    t = await db.pool.fetchrow("SELECT * FROM trucks WHERE id=$1 AND owner=$2", int(tid), uid)
+    c = await db.pool.fetchrow(
+        "SELECT * FROM contracts WHERE id=$1 AND owner=$2 AND trips_done<trips_total AND expires_at>now()",
+        int(cid), uid)
+    if not t or not c or t["busy"]:
+        await call.answer("Контракт или фура недоступны")
+        return
+    p = await get_player(uid)
+    fuel = await game.fuel_for(p, t, c["km"], c["from_city"], c["to_city"])
+    price = c["price_per_trip"]
+    left = (c["expires_at"] - game.now()).total_seconds()
+    text = (f"📋 <b>Контракт: {esc(c['client'])}</b>\n"
+            f"Груз: {c['cargo']}, {c['tons']} т · {c['km']} км\n"
+            f"{esc(c['from_city'])} → {esc(c['to_label'] or c['to_city'])}\n"
+            f"Рейс {c['trips_done'] + 1} из {c['trips_total']}\n\n"
+            f"💰 За рейс: <b>{money(price)}</b>\n⛽ Топливо: −{money(fuel)}\n"
+            f"📈 Прибыль: ~{money(price - fuel)}\n\n"
+            f"⏳ Контракт действует ещё {dur(left)}")
+    if c["tons"] > t["capacity"]:
+        text += f"\n❌ Груз {c['tons']} т тяжелее фуры ({t['capacity']} т)"
+    await show(call, text, kb([[("✅ Взять рейс", f"ctake:{tid}:{cid}")], [("⬅️ К заказам", f"orders:{tid}")]]))
+
+
+@router.callback_query(F.data.startswith("ctake:"))
+async def contract_trip_take(call: CallbackQuery):
+    _, tid, cid = call.data.split(":")
+    await driver_prompt(call, int(tid), f"k{cid}")
 
 
 @router.callback_query(F.data.startswith("take:"))
@@ -601,8 +655,10 @@ async def run_trip(call: CallbackQuery, tid, payload, did):
     uid = call.from_user.id
     if payload[0] == "o":
         err = await game.start_trip(uid, tid, order_id=int(payload[1:]), driver_id=did or None)
+    elif payload[0] == "k":
+        err = await game.start_trip(uid, tid, contract_id=int(payload[1:]), driver_id=did or None)
     else:
-        err = await game.start_trip(uid, tid, dest=CITIES[int(payload[1:])], driver_id=did or None)
+        err = await game.start_trip(uid, tid, dest=ALL_CITIES[int(payload[1:])], driver_id=did or None)
     if err:
         await call.answer(err, show_alert=True)
         return
@@ -619,11 +675,16 @@ async def move_menu(call: CallbackQuery):
     if not t or t["busy"]:
         await call.answer("Фура недоступна")
         return
+    lic = await game.licensed_cities(uid)
+    if game.visa_blocked(t["city"], lic):
+        await call.answer(f"Нужна виза: {country_of(t['city'])}", show_alert=True)
+        return
     rows = []
-    for i, c in enumerate(CITIES):
-        if c != t["city"]:
-            km = dist(t["city"], c)
-            rows.append([(f"{c} · {km} км · ~{dur(game.travel_seconds(km, t['speed']))}", f"moveto:{tid}:{i}")])
+    for i, c in enumerate(ALL_CITIES):
+        km = dist(t["city"], c) if c != t["city"] else 0
+        if km <= 0 or (country_of(c) != HOME and c not in lic):
+            continue
+        rows.append([(f"{c} · {km} км · ~{dur(game.travel_seconds(km, t['speed']))}", f"moveto:{tid}:{i}")])
     rows.append([("⬅️ Назад", f"truck:{tid}")])
     await show(call, "🚚 <b>Порожний перегон</b>\nВ другой город без груза: за ваш счёт (топливо), без дохода.", kb(rows))
 
@@ -640,16 +701,43 @@ async def licenses(call: CallbackQuery):
     uid = call.from_user.id
     rows = await db.pool.fetch("SELECT city, expires_at FROM licenses WHERE owner=$1", uid)
     exp = {r["city"]: r["expires_at"] for r in rows}
+    vrows = await db.pool.fetch("SELECT * FROM visas WHERE owner=$1", uid)
+    vmap = {r["country"]: r for r in vrows}
+    lvl = await game.player_level(uid)
     n = game.now()
-    lines = [f"🪪 <b>Лицензии на города</b>\nДействуют {LICENSE_DAYS} дней. Нужны для заказов в этот город.\n"]
+    lines = [f"🪪 <b>Лицензии и визы</b>\n\n🗺 <b>Города РФ</b>: лицензия действует {LICENSE_DAYS} дней, нужна для заказов в город.\n"]
     btns = []
     for i, c in enumerate(CITIES):
         e = exp.get(c)
         status = f"✅ ещё {dur((e - n).total_seconds())}" if e and e > n else "❌ нет"
         lines.append(f"{c}: {status} · {money(LICENSE_PRICE[c])}")
         btns.append([(f"{'Продлить' if e and e > n else 'Купить'}: {c}", f"buylic:{i}")])
+    lines.append("\n🛂 <b>Визы в другие страны</b>: оформляются около суток, действуют 30 дней. "
+                 "С визой берёте заказы в города страны и везёте туда.\n")
+    for j, (country, info) in enumerate(FOREIGN.items()):
+        v = vmap.get(country)
+        active = bool(v and v["expires_at"] > n and v["ready_at"] <= n)
+        if v and v["expires_at"] > n and v["ready_at"] > n:
+            status = f"⏳ оформляется, около {dur((v['ready_at'] - n).total_seconds())}"
+        elif active:
+            status = f"✅ ещё {dur((v['expires_at'] - n).total_seconds())}"
+        else:
+            status = "❌ нет"
+        lock = "" if progression.visa_ok(country, lvl) else f" · откроется с {info['visa_level']} ур."
+        lines.append(f"{country} ({', '.join(info['cities'])}): {status} · {money(info['visa_price'])}{lock}")
+        verb = "Продлить визу" if active else "Оформить визу"
+        btns.append([(f"{verb}: {country}", f"visa:{j}")])
     btns.append([("⬅️ Меню", "menu")])
     await show(call, "\n".join(lines), kb(btns))
+
+
+@router.callback_query(F.data.startswith("visa:"))
+async def visa_buy(call: CallbackQuery):
+    country = list(FOREIGN)[int(call.data.split(":")[1])]
+    ok, msg = await visas.buy(call.from_user.id, country)
+    await call.answer(msg, show_alert=True)
+    if ok:
+        await licenses(call)
 
 
 @router.callback_query(F.data.startswith("buylic:"))
@@ -901,8 +989,13 @@ async def contracts_list(call: CallbackQuery):
             if not maintenance.in_service(full):
                 cities_with_trucks.add(t["city"])
 
-        lines = ["📋 <b>Контракты</b>\n"]
+        lines = ["📋 <b>Контракты</b>\nКрупные клиенты платят в 1.5–1.8 раза больше обычного заказа, "
+                 f"но предлагают их редко. Одновременно можно вести до {contracts.MAX_ACTIVE}.\n"]
         rows = []
+        lvl = await game.player_level(uid)
+        locked = [(n, m) for n, m in contracts.CONTRACT_CLIENTS if m > lvl]
+        if locked:
+            lines.append("🔒 Откроются: " + ", ".join(f"{n} (с {m} ур.)" for n, m in locked) + "\n")
 
         if active:
             lines.append("<b>Текущие контракты:</b>")
@@ -933,7 +1026,8 @@ async def contracts_by_city(call: CallbackQuery):
         city = call.data.split(":", 1)[1]
         uid = call.from_user.id
         lic = await game.licensed_cities(uid)
-        avail = await contracts.available_contracts(uid, city, lic)
+        lvl = await game.player_level(uid)
+        avail = await contracts.available_contracts(uid, city, lic, lvl)
 
         lines = [f"📋 <b>Контракты в {city}</b>\n"]
         rows = []
@@ -942,7 +1036,7 @@ async def contracts_by_city(call: CallbackQuery):
             for i, c in enumerate(avail, 1):
                 lines.append(f"{i}. {esc(c['client'])}: {c['cargo']}")
                 lines.append(f"   {c['to_city']} · {c['tons']} т · {c['km']} км")
-                lines.append(f"   {money(c['price_per_trip'])} за рейс × 7 рейсов")
+                lines.append(f"   {money(c['price_per_trip'])} за рейс × {contracts.CONTRACT_TRIPS} рейсов")
                 rows.append([(f"Взять {i}", f"contract:{city}:{c['client']}")])
         else:
             lines.append("Нет доступных контрактов в этом городе. Загляните позже.")
@@ -963,7 +1057,8 @@ async def contract_take(call: CallbackQuery):
         client_name = parts[2]
 
         lic = await game.licensed_cities(uid)
-        err = await contracts.take_contract(uid, city, lic, client_name)
+        lvl = await game.player_level(uid)
+        err = await contracts.take_contract(uid, city, lic, client_name, lvl)
         if err:
             await call.answer(err, show_alert=True)
             return
@@ -1017,21 +1112,21 @@ async def fuel_card_buy(call: CallbackQuery):
 # ---------- кредиты ----------
 @router.callback_query(F.data == "loan_take")
 async def loan_take_menu(call: CallbackQuery):
-    amounts = [500_000, 1_000_000, 2_000_000, 4_000_000, 8_000_000]
+    limit = progression.loan_limit(await game.player_level(call.from_user.id))
+    amounts = [a for a in (500_000, 1_000_000, 2_000_000, 4_000_000, 8_000_000) if a <= limit]
     rows = [[(f"{money(a)}", f"loan_go:{a}")] for a in amounts]
     rows.append([("⬅️ Назад", "bank")])
-    await show(call, "💳 <b>Выберите сумму кредита:</b>", kb(rows))
+    await show(call, f"💳 <b>Выберите сумму кредита:</b>\nВаш лимит: {money(limit)} (растёт с уровнем компании)", kb(rows))
 
 
 @router.callback_query(F.data.startswith("loan_go:"))
 async def loan_take_go(call: CallbackQuery):
     uid = call.from_user.id
     amount = int(call.data.split(":")[1])
-    err = await loans.take_loan(uid, amount)
-    if err:
-        await call.answer(err, show_alert=True)
+    ok, msg = await loans.take_loan(uid, amount)
+    await call.answer(msg, show_alert=True)
+    if not ok:
         return
-    await call.answer(f"Кредит {money(amount)} выдан!", show_alert=True)
     await bank(call)
 
 
@@ -1214,21 +1309,34 @@ async def help_view(call: CallbackQuery):
 
 <b>Основы:</b>
 • Берите заказы из города, где стоит ваша фура
-• Для рейсов между городами нужна лицензия (действует 14 дней)
+• Для рейсов между городами РФ нужна лицензия на город (действует 14 дней)
 • Перед рейсом вы получите аванс 30%, из него оплачивается топливо
 • За опоздание оплата уменьшается
 • Водитель отдыхает после 9 часов в пути
 
+<b>Страны:</b>
+• Беларусь (Минск, Гомель, Брест) со 2 уровня, Казахстан (Астана, Алматы, Караганда) с 4-го
+• Виза оформляется около суток и действует 30 дней, продлевается за деньги
+• Без визы зарубежный город недоступен; рейсы за границу платят на 20% больше
+
 <b>Бизнес:</b>
 • Нанимайте водителей, чтобы ездить на нескольких фурах одновременно
-• Покупайте топливные карты для скидок на топливо (5-10%)
-• Берите долгосрочные контракты от компаний (7 рейсов за 14 дней)
-• Возьмите кредит для развития автопарка
+• Топливные карты дают скидку на топливо (5-10%)
+• Контракты: 7 рейсов за 14 дней, платят в 1.5–1.8 раза больше обычного заказа; появляются редко
+• Возьмите кредит для развития автопарка (лимит растёт с уровнем)
 
 <b>Фура:</b>
 • Каждые 50-70 тыс км нужно техническое обслуживание
-• Страховка покрывает 70% стоимости ремонта при поломках и ДТП
+• Страховка покрывает 60% стоимости ремонта при поломках и ДТП
 • Поломку можно отремонтировать на месте или вызвать эвакуатор
+
+<b>Уровень компании</b> (растёт с опытом за рейсы):
+• Уровень 1: до 3 фур, города РФ по лицензии
+• Каждый уровень: +2% к оплате заказов (до +30%) и +2 фуры в лимите
+• Уровень 3: новые фуры в автосалоне, электроника в грузах
+• Уровень 4: грузы «Автомобили», кредит до 5 млн
+• Визы: Беларусь со 2 уровня, Казахстан с 4-го
+• Контракты: клиенты открываются со 2 по 6 уровень
 
 <b>Развитие:</b>
 • 📰 Новости регионов раз в сутки меняют оплату и скорость в городах
@@ -1240,7 +1348,8 @@ async def help_view(call: CallbackQuery):
 • Налоги считаются каждые 3 дня
 • НДС 22%, налог на прибыль 25%
 • При задержке платежа взимается штраф
-• Арестованный счёт автоматически платит из выручки"""
+• Арестованный счёт автоматически платит из выручки
+"""
 
     await show(call, text, kb([[("⬅️ Меню", "menu")]]))
 

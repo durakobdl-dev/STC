@@ -2,12 +2,12 @@ import random
 
 import db
 import finance
+import progression
 from data import BRANDS
 from util import money, now
 
 NOW_YEAR = 2026
 DEALER_CITIES = ["Москва", "Санкт-Петербург", "Екатеринбург", "Новосибирск"]
-MAX_TRUCKS = 20
 NEW_LOTS = 2
 USED_LOTS = 4
 SELL_PCT = 85       # при продаже фуры дают столько % от справедливой цены
@@ -62,8 +62,12 @@ async def buy(uid, lot_id):
             lot = await c.fetchrow("SELECT * FROM dealer_stock WHERE id=$1 FOR UPDATE", lot_id)
             if not p or not lot:
                 return "Эту фуру уже купили."
-            if await c.fetchval("SELECT count(*) FROM trucks WHERE owner=$1", uid) >= MAX_TRUCKS:
-                return f"Максимум фур в компании: {MAX_TRUCKS}."
+            lvl = progression.level(p["xp"])
+            if lot["is_new"] and lvl < progression.NEW_TRUCKS_LEVEL:
+                return f"Новые фуры продаются с {progression.NEW_TRUCKS_LEVEL} уровня компании."
+            limit = progression.max_trucks(lvl)
+            if await c.fetchval("SELECT count(*) FROM trucks WHERE owner=$1", uid) >= limit:
+                return f"Лимит фур на вашем уровне: {limit}. Повышайте уровень компании, чтобы расширять парк."
             if p["money"] < lot["price"]:
                 return f"Не хватает денег: фура стоит {money(lot['price'])}."
             b = spec(lot["brand"], lot["model"])

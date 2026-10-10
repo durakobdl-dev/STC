@@ -16,13 +16,14 @@ import contracts
 import news
 import skills
 import bases
+import visas
+import pricing
+import progression
+from progression import level, cargo_ok
 from util import bar, dur, esc, money, now
 from config import (ADVANCE_PCT, DEFAULT_DRIVER_RATING, REAL_KM, FAR_SPEED, REST_PCT)
-from data import (CARGO, CLIENTS, FUEL, SUBURBAN, URGENT_CLIENTS, dist, waypoints)
-
-
-def level(xp):
-    return 1 + int(math.sqrt(xp / 60))
+from data import (CARGO, CLIENT_CARGO, CLIENTS, FUEL, FOREIGN, SUBURBAN, URGENT_CLIENTS, HOME,
+                  country_of, dist, waypoints)
 
 
 def season_factor():
@@ -73,7 +74,20 @@ async def fuel_for(p, t, km, a, b):
 
 
 # ---------- заказы ----------
-def make_order(owner, city, licensed):
+def pick_cargo(urgent, lvl):
+    """Груз и клиент согласованы: срочные заказы маркетплейсов везут только то, что они продают."""
+    if urgent:
+        client = random.choice(URGENT_CLIENTS)
+        options = [c for c in CLIENT_CARGO[client] if cargo_ok(c, lvl)]
+    else:
+        options = [c for c in CARGO if cargo_ok(c, lvl)]
+        cargo = random.choice(options)
+        client = random.choice([c for c in CLIENTS if cargo in CLIENT_CARGO[c]])
+        return cargo, client
+    return random.choice(options), client
+
+
+def make_order(owner, city, licensed, lvl=1):
     inter = [c for c in licensed if c != city and dist(city, c)]
     suburban = (not inter) or random.random() < 0.4
     if suburban:
@@ -83,27 +97,13 @@ def make_order(owner, city, licensed):
         to = random.choice(inter)
         km, label = dist(city, to), to
     tons = random.randint(10, 24) if km < 300 else random.randint(4, 24)
-    cargo = random.choice(list(CARGO))
     urgent = random.random() < 0.12
-    # Короткие маршруты платят больше за км — погрузка/разгрузка съедает время
-    if km < 150:
-        short_bonus = 3.5
-    elif km < 300:
-        short_bonus = max(1.5, 3.0 - km / 200)
-    elif km < 400:
-        short_bonus = 1.2
-    else:
-        short_bonus = 1.0
-    min_price = 30_000 if km < 150 else (25_000 if km < 300 else 20_000)
-    max_price = 70_000 if km < 150 else (90_000 if km < 300 else 350_000)  # макс 350k для дальних
-    price = max(min_price, int(tons * km * CARGO[cargo] * short_bonus * random.uniform(0.9, 1.1) / 100) * 100)
-    if max_price:
-        price = min(price, max_price)
+    cargo, client = pick_cargo(urgent, lvl)
+    price = pricing.order_price(tons, km, cargo, lvl, pricing.border_s(city, to) > 0)
     if urgent:
         price = int(price * 1.5 / 100) * 100
-    base = load_seconds(tons) + travel_seconds(km, 88)
+    base = load_seconds(tons) + travel_seconds(km, 88) + pricing.border_s(city, to)
     limit = int(base * (1.05 if urgent else 1.15))
-    client = random.choice(URGENT_CLIENTS if urgent else CLIENTS)
     expires = now() + timedelta(minutes=random.randint(60, 240))
     return (owner, city, to, label, cargo, tons, km, price, client, urgent, limit, expires)
 
@@ -125,15 +125,16 @@ async def ensure_orders(owner, city, licensed, target=7):
     await db.pool.execute("DELETE FROM orders WHERE owner=$1 AND expires_at<=now()", owner)
     have = await db.pool.fetchval("SELECT count(*) FROM orders WHERE owner=$1 AND from_city=$2", owner, city)
     events = await news.active()
+    lvl = await player_level(owner)
     for _ in range(max(0, target - have)):
-        await db.pool.execute(_INSERT_ORDER, *apply_news(make_order(owner, city, licensed), events))
+        await db.pool.execute(_INSERT_ORDER, *apply_news(make_order(owner, city, licensed, lvl), events))
     # Диспетчер на базе открывает скрытые VIP-заказы
     if await bases.has_dispatcher(owner, city):
         vip = await db.pool.fetchval(
             "SELECT count(*) FROM orders WHERE owner=$1 AND from_city=$2 AND client LIKE $3",
             owner, city, VIP_PREFIX + "%")
         for _ in range(max(0, bases.VIP_ORDERS - vip)):
-            o = list(apply_news(make_order(owner, city, licensed), events))
+            o = list(apply_news(make_order(owner, city, licensed, lvl), events))
             o[7] = int(o[7] * bases.VIP_BONUS / 100) * 100      # price
             o[8] = VIP_PREFIX + o[8]                            # client
             o[9] = True                                         # urgent -> 🔥
@@ -142,9 +143,23 @@ async def ensure_orders(owner, city, licensed, target=7):
             await db.pool.execute(_INSERT_ORDER, *o)
 
 
+async def player_level(owner):
+    xp = await db.pool.fetchval("SELECT xp FROM players WHERE id=$1", owner) or 0
+    return level(xp)
+
+
 async def licensed_cities(owner):
+    """Города, куда можно ездить: города РФ по лицензии и все города стран с действующей визой."""
     rows = await db.pool.fetch("SELECT city FROM licenses WHERE owner=$1 AND expires_at>now()", owner)
-    return [r["city"] for r in rows]
+    cities = [r["city"] for r in rows]
+    for country in await visas.active_countries(owner):
+        cities += FOREIGN[country]["cities"]
+    return cities
+
+
+def visa_blocked(city, lic):
+    """Зарубежный город без визы: там нельзя брать заказы."""
+    return country_of(city) != HOME and city not in lic
 
 
 # ---------- рейсы ----------
@@ -184,7 +199,7 @@ async def start_trip(uid, truck_id, order_id=None, dest=None, driver_id=None, co
                     return "Контракт недоступен."
                 if ct["tons"] > t["capacity"]:
                     return f"Груз {ct['tons']} т тяжелее, чем грузоподъёмность фуры ({t['capacity']} т)."
-                to, label, cargo, tons, km = ct["to_city"], ct["to_city"], ct["cargo"], ct["tons"], ct["km"]
+                to, label, cargo, tons, km = ct["to_city"], ct["to_label"] or ct["to_city"], ct["cargo"], ct["tons"], ct["km"]
                 price = ct["price_per_trip"]
                 limit = 10**9
                 empty = False
@@ -204,6 +219,10 @@ async def start_trip(uid, truck_id, order_id=None, dest=None, driver_id=None, co
                 to, label, cargo, tons = dest, dest, "Порожний перегон", 0
                 km, price, empty = dist(t["city"], dest), 0, True
                 limit = 10**9
+            for city in (t["city"], to):
+                country = country_of(city)
+                if country != HOME and not await _has_visa(c, uid, country):
+                    return f"Нужна действующая виза: {country}. Оформите её во вкладке «Лицензии»."
             fuel = await fuel_for(p, t, km, t["city"], to)
             advance = price * skills.advance_pct(p, ADVANCE_PCT) // 100
             speed_k = await news.route_speed(t["city"], to)
@@ -212,7 +231,7 @@ async def start_trip(uid, truck_id, order_id=None, dest=None, driver_id=None, co
                         f"у вас {money(p['money'])} + аванс {money(advance)}.")
             start = now()
             load_end = start + timedelta(seconds=0 if empty else load_seconds(tons))
-            arrive = load_end + timedelta(seconds=travel_seconds(km, t["speed"] * speed_k))
+            arrive = load_end + timedelta(seconds=travel_seconds(km, t["speed"] * speed_k) + pricing.border_s(t["city"], to))
             finish = arrive + timedelta(seconds=0 if empty else load_seconds(tons))
             deadline = start + timedelta(seconds=limit)
             ik, isev, iat = maintenance.roll_incident(t, km, rating, load_end, arrive)
@@ -233,6 +252,11 @@ async def start_trip(uid, truck_id, order_id=None, dest=None, driver_id=None, co
             if order_id is not None:
                 await c.execute("DELETE FROM orders WHERE id=$1", order_id)
     return None
+
+
+async def _has_visa(c, uid, country):
+    return bool(await c.fetchval(
+        "SELECT 1 FROM visas WHERE owner=$1 AND country=$2 AND ready_at<=now() AND expires_at>now()", uid, country))
 
 
 async def active_trip(truck_id):
@@ -337,6 +361,7 @@ async def watcher(bot):
             await finance.process(bot)
             await loans.process_payments(bot)
             await news.process()
+            await visas.notify(bot)
         except Exception:
             logging.exception("watcher error")
         await asyncio.sleep(15)

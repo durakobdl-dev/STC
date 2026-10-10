@@ -178,6 +178,7 @@ async def wipe_all(admin_id, confirm_code):
             await c.execute("DELETE FROM licenses")
             await c.execute("DELETE FROM orders")
             await c.execute("DELETE FROM bases")
+            await c.execute("DELETE FROM visas")
             await c.execute("DELETE FROM news_events")
             await c.execute("DELETE FROM trucks")
             await c.execute("DELETE FROM players")

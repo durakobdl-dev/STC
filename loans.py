@@ -4,6 +4,7 @@ from datetime import timedelta
 
 import db
 import finance
+import progression
 from util import money, now
 
 
@@ -32,17 +33,20 @@ async def active_loan(uid):
 
 
 async def take_loan(uid, amount: int):
-    """Берёт кредит. Возвращает (ok, текст)."""
-    if amount > MAX_AMOUNT:
-        return False, f"Максимум кредита: {money(MAX_AMOUNT)}."
-    if amount < 100_000:
-        return False, "Минимум кредита: 100 000 ₽."
+    """Берёт кредит. Возвращает (ok, текст). Лимит растёт с уровнем компании."""
     async with db.pool.acquire() as c:
         async with c.transaction():
+            p = await c.fetchrow("SELECT money, xp FROM players WHERE id=$1 FOR UPDATE", uid)
+            if not p:
+                return False, "Игрок не найден."
+            limit = progression.loan_limit(progression.level(p["xp"]))
+            if amount > limit:
+                return False, f"Ваш лимит кредита: {money(limit)} (растёт с уровнем компании)."
+            if amount < 100_000:
+                return False, "Минимум кредита: 100 000 ₽."
             active = await c.fetchval("SELECT count(*) FROM loans WHERE owner=$1 AND remaining>0", uid)
             if active:
                 return False, "У вас уже есть активный кредит. Погасите его сначала."
-            p = await c.fetchrow("SELECT money FROM players WHERE id=$1 FOR UPDATE", uid)
             monthly, overpay = payment_amount(amount)
             next_payment = now() + timedelta(days=30)
             await c.execute("UPDATE players SET money=money+$2 WHERE id=$1", uid, amount)
